@@ -43,6 +43,7 @@ use storage::{MembershipStorage, MembershipStorageAdapter};
 use subnetworks_assignations::{MembershipCreator, MembershipHandler, SubnetworkAssignations};
 use tokio::sync::{
     broadcast,
+    broadcast::Sender,
     mpsc::{self},
     oneshot,
 };
@@ -60,6 +61,9 @@ use crate::{
 };
 
 pub type DaAddressbook = AddressBook;
+
+// todo: export as config param when deployment config is merged
+const ASSIGNATIONS_PRUNE_WINDOW: u64 = 8;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MembershipResponse {
@@ -192,7 +196,7 @@ pub struct NetworkService<
     membership: DaMembershipHandler<Membership>,
     addressbook: DaAddressbook,
     api_adapter: ApiAdapter,
-    subnet_refresh_sender: broadcast::Sender<()>,
+    subnet_refresh_sender: Sender<()>,
     balancer_stats_stream: UnboundedReceiverStream<BalancerStats>,
     opinion_stream: UnboundedReceiverStream<OpinionEvent>,
     subnet_refresh_interval: Duration,
@@ -357,10 +361,6 @@ where
         })
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "TODO: refactor after tests are green"
-    )]
     async fn run(mut self) -> Result<(), overwatch::DynError> {
         let Self {
             service_resources_handle:
@@ -442,21 +442,14 @@ where
                     Self::handle_network_service_message(msg, backend, &membership_storage, api_adapter, addressbook).await;
                 }
                 Some(update) = membership_updates_stream.next() => {
-                    Self::handle_opinion_session_change(&sdp_adapter, &mut opinion_aggregator, &update).await;
-                    match Self::handle_membership_update(
-                        update.session_id,
-                        update.peers,
+                    Self::handle_membership_update_event(
+                        &sdp_adapter,
+                        &mut opinion_aggregator,
+                        update,
                         &membership_storage,
-                        update.provider_mappings,
-                    ).await {
-                        Ok(membership_status) => {
-                            let _ = subnet_refresh_sender.send(());
-                            backend.update_session_status(membership_status);
-                        }
-                        Err(e) => {
-                            tracing::error!("Error handling membership update for session {}: {e}", update.session_id);
-                        }
-                    }
+                        subnet_refresh_sender,
+                        backend,
+                    ).await;
                 }
                 Some(stats) = balancer_stats_stream.next() => {
                     let connected_subnetworks = stats.values()
@@ -636,6 +629,46 @@ where
                 )
                 .await;
             }
+        }
+    }
+
+    async fn handle_membership_update_event(
+        sdp_adapter: &SdpAdapter,
+        opinion_aggregator: &mut OpinionAggregator<Arc<StorageAdapter>>,
+        update: SubnetworkPeers<Membership::Id>,
+        membership_storage: &MembershipStorage<Arc<StorageAdapter>, Membership, DaAddressbook>,
+        subnet_refresh_sender: &Sender<()>,
+        backend: &mut Backend,
+    ) {
+        Self::handle_opinion_session_change(sdp_adapter, opinion_aggregator, &update).await;
+
+        match Self::handle_membership_update(
+            update.session_id,
+            update.peers.clone(),
+            membership_storage,
+            update.provider_mappings.clone(),
+        )
+        .await
+        {
+            Ok(membership_status) => {
+                let _ = subnet_refresh_sender.send(());
+                backend.update_session_status(membership_status);
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Error handling membership update for session {}: {e}",
+                    update.session_id
+                );
+            }
+        }
+
+        if let Some(cutoff) = update.session_id.checked_sub(ASSIGNATIONS_PRUNE_WINDOW)
+            && let Err(e) = membership_storage.prune(cutoff).await
+        {
+            tracing::error!(
+                "Error membership prune on session {}: {e}",
+                update.session_id
+            );
         }
     }
 
