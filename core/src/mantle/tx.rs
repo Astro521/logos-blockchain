@@ -12,11 +12,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::{
     crypto::{Digest as _, Hash, Hasher},
     mantle::{
-        AuthenticatedMantleTx, StorageSize, Transaction, TransactionHasher, Value,
-        channel::Channels,
-        encoding::{Ops, decode_mantle_tx, encode_mantle_tx, encode_signed_mantle_tx},
+        AuthenticatedMantleTx, StorageSize, Transaction, TransactionHasher,
+        encoding::{decode_mantle_tx, encode_mantle_tx, encode_signed_mantle_tx},
         gas::{Gas, GasCalculator, GasConstants, GasCost, GasOverflow, GasPrice},
-        genesis_tx::{GENESIS_EXECUTION_GAS_PRICE, GENESIS_STORAGE_GAS_PRICE},
         ops::{
             Op, OpProof,
             channel::{ChannelId, ChannelKeyIndex, withdraw::ChannelWithdrawOp},
@@ -168,7 +166,11 @@ impl MantleTxGasContext {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MantleTx(pub Ops);
+pub struct MantleTx {
+    pub ops: Vec<Op>,
+    pub execution_gas_price: GasPrice,
+    pub storage_gas_price: GasPrice,
+}
 
 impl From<MantleTxDeSerImpl> for MantleTx {
     fn from(MantleTxDeSerImpl { ops }: MantleTxDeSerImpl) -> Self {
@@ -221,8 +223,7 @@ impl GasCalculator for MantleTx {
         context: &Self::Context,
     ) -> Result<GasCost, GasOverflow> {
         let execution_gas = self.execution_gas_consumption::<Constants>(context);
-        let execution_gas_cost =
-            GasCost::calculate(execution_gas?, context.gas_prices.execution_base_gas_price)?;
+        let execution_gas_cost = GasCost::calculate(execution_gas?, self.execution_gas_price)?;
         let storage_gas_cost = self.storage_gas_cost(context)?;
 
         execution_gas_cost.checked_add(storage_gas_cost)
@@ -239,7 +240,7 @@ impl GasCalculator for MantleTx {
         &self,
         _context: &Self::Context,
     ) -> Result<Gas, GasOverflow> {
-        self.ops()
+        self.ops
             .iter()
             .map(Op::execution_gas::<Constants>)
             .try_fold(Gas::from(0), Gas::checked_add)
@@ -565,32 +566,20 @@ impl AuthenticatedMantleTx for SignedMantleTx {
         self.mantle_tx.ops().iter().zip(self.ops_proofs.iter())
     }
 
-    fn total_gas_cost<Constants: GasConstants>(
-        &self,
-        context: <Self as AuthenticatedMantleTx>::Context,
-    ) -> Result<GasCost, GasOverflow> {
-        GasCalculator::total_gas_cost::<Constants>(&self, &context)
+    fn total_gas_cost<Constants: GasConstants>(&self) -> Result<GasCost, GasOverflow> {
+        GasCalculator::total_gas_cost::<Constants>(&self, &())
     }
 
-    fn storage_gas_cost(
-        &self,
-        context: <Self as AuthenticatedMantleTx>::Context,
-    ) -> Result<GasCost, GasOverflow> {
-        GasCalculator::storage_gas_cost(&self, &context)
+    fn storage_gas_cost(&self) -> Result<GasCost, GasOverflow> {
+        GasCalculator::storage_gas_cost(&self, &())
     }
 
-    fn execution_gas_consumption<Constants: GasConstants>(
-        &self,
-        context: <Self as AuthenticatedMantleTx>::Context,
-    ) -> Result<Gas, GasOverflow> {
-        GasCalculator::execution_gas_consumption::<Constants>(&self, &context)
+    fn execution_gas_consumption<Constants: GasConstants>(&self) -> Result<Gas, GasOverflow> {
+        GasCalculator::execution_gas_consumption::<Constants>(&self, &())
     }
 
-    fn storage_gas_consumption(
-        &self,
-        context: <Self as AuthenticatedMantleTx>::Context,
-    ) -> Result<Gas, GasOverflow> {
-        GasCalculator::storage_gas_consumption(&self, &context)
+    fn storage_gas_consumption(&self) -> Result<Gas, GasOverflow> {
+        GasCalculator::storage_gas_consumption(&self, &())
     }
 
     fn verify_ops_proofs_with_helper(
@@ -610,7 +599,7 @@ impl GasCalculator for SignedMantleTx {
     ) -> Result<GasCost, GasOverflow> {
         let execution_gas = GasCalculator::execution_gas_consumption::<Constants>(&self, context)?;
         let execution_gas_cost =
-            GasCost::calculate(execution_gas, context.execution_base_gas_price)?;
+            GasCost::calculate(execution_gas, self.mantle_tx.execution_gas_price)?;
         let storage_gas_cost = GasCalculator::storage_gas_cost(self, context)?;
 
         execution_gas_cost.checked_add(storage_gas_cost)
@@ -671,7 +660,11 @@ mod tests {
     };
 
     fn create_test_mantle_tx(ops: Vec<Op>) -> MantleTx {
-        MantleTx(Ops::new_unchecked(ops))
+        MantleTx {
+            ops,
+            execution_gas_price: 1.into(),
+            storage_gas_price: 1.into(),
+        }
     }
 
     fn create_test_inscribe_op(signing_key: &Ed25519Key) -> InscriptionOp {

@@ -30,7 +30,11 @@ impl MantleTxBuilder {
     #[must_use]
     pub fn new(context: MantleTxContext) -> Self {
         Self {
-            mantle_tx: MantleTx(Ops::new()),
+            mantle_tx: MantleTx {
+                ops: vec![],
+                execution_gas_price: 0.into(),
+                storage_gas_price: 0.into(),
+            },
             ledger_inputs: vec![],
             pending_transfer: TransferOp::new(Inputs::new(vec![]), Outputs::new(vec![])),
             channel_multi_sig_proofs: HashMap::new(),
@@ -88,6 +92,18 @@ impl MantleTxBuilder {
     #[must_use]
     pub fn extend_ledger_outputs(mut self, notes: impl IntoIterator<Item = Note>) -> Self {
         self.pending_transfer.outputs.as_mut().extend(notes);
+        self
+    }
+
+    #[must_use]
+    pub const fn set_execution_gas_price(mut self, price: GasPrice) -> Self {
+        self.mantle_tx.execution_gas_price = price;
+        self
+    }
+
+    #[must_use]
+    pub const fn set_storage_gas_price(mut self, price: GasPrice) -> Self {
+        self.mantle_tx.storage_gas_price = price;
         self
     }
 

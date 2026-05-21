@@ -10,9 +10,7 @@ use lb_core::{
     mantle::{
         GenesisTx, NoteId, TxHash, Utxo, Value,
         gas::{Gas, GasConstants, GasCost, GasPrice},
-        genesis_tx::{GENESIS_EXECUTION_GAS_PRICE, GENESIS_STORAGE_GAS_PRICE},
-        ledger::Operation as _,
-        ops::transfer::{TransferOp, TransferValidationContext},
+        ops::transfer::TransferOp,
     },
     proofs::leader_proof::{self, LeaderPublic},
     sdp::locked_notes::LockedNotes,
@@ -154,7 +152,7 @@ pub struct LedgerState {
     #[derivative(PartialEq = "ignore")]
     stake_inference: Arc<StakeInference>,
     // rolling fee window of 120 blocks, used to derive block rewards
-    #[serde(with = "serde_arrays")]
+    #[cfg_attr(feature = "serde", serde(with = "serde_arrays"))]
     fee_window: [GasCost; WINDOW_SIZE],
     // Smoothed Average Execution Gas used up to the last block
     average_execution_gas: Gas,
@@ -427,12 +425,16 @@ impl LedgerState {
             .balance(&self.utxos)
             .map_err(mantle::Error::Transfer)?;
 
-        //execute the transfer
-        let (result, events) = transfer_op
-            .execute(self.utxos)
-            .map_err(mantle::Error::Transfer)?;
-        self.utxos = result;
-        Ok((self, balance, events))
+        for utxo in transfer_op.utxos() {
+            if utxo.note.value == 0 {
+                return Err(LedgerError::ZeroValueNote);
+            }
+            balance = balance
+                .checked_sub(utxo.note.value.into())
+                .ok_or(LedgerError::BalanceOverflow)?;
+            self.utxos = self.utxos.insert(utxo.id(), utxo).0;
+        }
+        Ok((self, balance))
     }
 
     fn update_nonce(self, contrib: &Fr, slot: Slot) -> Self {
@@ -614,13 +616,13 @@ fn update_storage_market(
     storage_gas_consumed_in_epoch: Gas,
     storage_gas_ema: Gas,
 ) -> (GasPrice, Gas) {
-    let previous_price = u128::from(storage_gas_price.into_inner());
-    let total_storage_gas = u128::from(storage_gas_consumed_in_epoch.into_inner());
-    let previous_ema = u128::from(storage_gas_ema.into_inner());
+    let previous_price = storage_gas_price.into_inner() as u128;
+    let total_storage_gas = storage_gas_consumed_in_epoch.into_inner() as u128;
+    let previous_ema = storage_gas_ema.into_inner() as u128;
 
     let new_ema: Gas =
         (((total_storage_gas + previous_ema) / STORAGE_MARKET_EMA_DENOMINATOR) as Value).into();
-    let new_ema_unsigned = u128::from(new_ema.into_inner());
+    let new_ema_unsigned = new_ema.into_inner() as u128;
     let comparator = STORAGE_MARKET_CLAMP_DENOMINATOR * total_storage_gas;
     let new_price = if comparator <= STORAGE_MARKET_CLAMP_DOWN_NUMERATOR * new_ema_unsigned {
         ((previous_price * STORAGE_MARKET_CLAMP_DOWN_NUMERATOR / STORAGE_MARKET_CLAMP_DENOMINATOR)

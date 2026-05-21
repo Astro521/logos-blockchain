@@ -14,10 +14,8 @@ pub mod select;
 pub mod tx;
 pub mod tx_builder;
 
-mod nom;
-
 pub use gas::{GasCalculator, GasConstants};
-pub use genesis_tx::CryptarchiaParameter;
+use lb_groth16::Fr;
 pub use ledger::{Note, NoteId, Utxo, Value};
 pub use ops::{Op, OpProof};
 use ops::{channel::inscribe::InscriptionOp, sdp::SDPDeclareOp};
@@ -51,7 +49,6 @@ pub trait Transaction {
 }
 
 pub trait AuthenticatedMantleTx: Transaction<Hash = TxHash> + GasCalculator + StorageSize {
-    type Context;
     /// Returns the underlying `MantleTx` that this transaction represents.
     fn mantle_tx(&self) -> &MantleTx;
 

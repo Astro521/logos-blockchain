@@ -1868,8 +1868,11 @@ fn create_channel_config_tx(
         withdraw_threshold,
     };
 
-    // TODO: fund tx
-    let config_tx = MantleTx([Op::ChannelConfig(config_op)].into());
+    let set_keys_tx = MantleTx {
+        ops: vec![Op::ChannelSetKeys(set_keys_op)],
+        storage_gas_price: 0.into(),
+        execution_gas_price: 0.into(),
+    };
 
     let tx_hash = config_tx.hash();
     let signatures = signing_keys

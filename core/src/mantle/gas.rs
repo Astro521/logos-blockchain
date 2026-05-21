@@ -1,7 +1,4 @@
-use std::{
-    fmt::{self, Display},
-    ops::Add,
-};
+use std::fmt::{self, Display};
 
 use serde::{Deserialize, Serialize};
 
@@ -36,11 +33,6 @@ impl From<Value> for Gas {
 pub struct GasPrice(Value);
 
 impl GasPrice {
-    #[must_use]
-    pub const fn new(value: Value) -> Self {
-        Self(value)
-    }
-
     #[must_use]
     pub const fn into_inner(self) -> Value {
         self.0
@@ -181,13 +173,13 @@ pub trait GasConstants {
 pub struct MainnetGasConstants;
 
 impl GasConstants for MainnetGasConstants {
-    const TRANSFER: Gas = Gas(590);
-    const CHANNEL_INSCRIBE: Gas = Gas(56);
-    const CHANNEL_CONFIG: Gas = Gas(56);
-    const CHANNEL_DEPOSIT: Gas = Gas(590);
-    const CHANNEL_WITHDRAW: Gas = Gas(56);
-    const SDP_DECLARE: Gas = Gas(646);
-    const SDP_WITHDRAW: Gas = Gas(590);
-    const SDP_ACTIVE: Gas = Gas(590);
-    const LEADER_CLAIM: Gas = Gas(580);
+    const TRANSFER: Gas = Gas(2705);
+    const CHANNEL_INSCRIBE: Gas = Gas(22);
+    const CHANNEL_SET_KEYS: Gas = Gas(22);
+    const CHANNEL_DEPOSIT: Gas = Gas(0);
+    const CHANNEL_WITHDRAW: Gas = Gas(22);
+    const SDP_DECLARE: Gas = Gas(2727);
+    const SDP_WITHDRAW: Gas = Gas(2705);
+    const SDP_ACTIVE: Gas = Gas(2705);
+    const LEADER_CLAIM: Gas = Gas(1150);
 }

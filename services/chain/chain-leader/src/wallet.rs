@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 use lb_core::{
     header::HeaderId,
     mantle::{
-        Note, Op, SignedMantleTx, Value,
+        Op, SignedMantleTx,
         gas::{GasCost, GasOverflow, MainnetGasConstants},
         ops::leader_claim::LeaderClaimOp,
         tx_builder::MantleTxBuilder,

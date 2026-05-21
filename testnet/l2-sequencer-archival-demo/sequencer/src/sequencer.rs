@@ -168,7 +168,11 @@ impl Sequencer {
             signer: verifying_key,
         };
 
-        let inscribe_tx = MantleTx([Op::ChannelInscribe(inscribe_op)].into());
+        let inscribe_tx = MantleTx {
+            ops: vec![Op::ChannelInscribe(inscribe_op)],
+            storage_gas_price: 0.into(),
+            execution_gas_price: 0.into(),
+        };
 
         let tx_hash = inscribe_tx.hash();
         let signature_bytes = self

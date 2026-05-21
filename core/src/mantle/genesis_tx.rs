@@ -8,11 +8,7 @@ use crate::{
     crypto::{Digest as _, Hasher},
     mantle::{
         MantleTx, Transaction, TransactionHasher, TxHash,
-        encoding::{
-            decode_field_element, decode_uint64, decode_unix_timestamp, decode_utf8_string,
-            encode_field_element, encode_string, encode_uint64, encode_unix_timestamp,
-        },
-        gas::{Gas, GasCalculator, GasConstants, GasCost, GasOverflow, GasPrice},
+        gas::{Gas, GasCalculator, GasConstants, GasCost, GasOverflow},
         ops::{
             Op,
             channel::{ChannelId, MsgId, inscribe::InscriptionOp},
@@ -67,6 +63,11 @@ pub enum Error {
 impl GenesisTx {
     pub fn from_tx(signed_mantle_tx: SignedMantleTx) -> Result<Self, Error> {
         let mantle_tx = &signed_mantle_tx.mantle_tx;
+
+        // Genesis transactions must have execution gas prices of 0 and storage gas of 0
+        if mantle_tx.execution_gas_price != 0.into() || mantle_tx.storage_gas_price != 0.into() {
+            return Err(Error::InvalidGenesisGasPrice);
+        }
 
         // Genesis transactions must contain exactly one transfer as the first op,
         // one inscription as the second op, and then may contain other SDP declarations

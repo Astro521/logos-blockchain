@@ -119,19 +119,23 @@ fn inscription_for_current_test(test_context: Option<&str>) -> InscriptionOp {
 #[must_use]
 pub fn create_genesis_block(utxos: &[Utxo], test_context: Option<&str>) -> GenesisBlock {
     // Create transfer op with the utxos as outputs
-    let mut outputs = utxos.iter().map(|u| u.note);
-    #[expect(
-        clippy::option_if_let_else,
-        reason = "Moving notes inside of consuming lambda function is harder to read"
-    )]
-    let genesis_builder = if let Some(note) = outputs.next() {
-        let mut genesis_builder = GenesisBlockBuilder::new().add_note(note);
-        for note in outputs {
-            genesis_builder = genesis_builder.add_note(note);
-        }
-        genesis_builder
-    } else {
-        panic!("No outputs provided for genesis block")
+    let outputs: Vec<Note> = utxos.iter().map(|u| u.note).collect();
+    let transfer_op = TransferOp::new(vec![], outputs);
+
+    // Create the mantle transaction
+    let mantle_tx = MantleTx {
+        ops: vec![Op::Transfer(transfer_op), Op::ChannelInscribe(inscription)],
+        execution_gas_price: 0.into(),
+        storage_gas_price: 0.into(),
+    };
+    let signed_mantle_tx = SignedMantleTx {
+        mantle_tx,
+        ops_proofs: vec![
+            OpProof::ZkSig(ZkSignature::new(CompressedGroth16Proof::from_bytes(
+                &[0u8; 128],
+            ))),
+            OpProof::NoProof,
+        ],
     };
 
     let inscription = inscription_for_current_test(test_context);
@@ -296,7 +300,15 @@ pub fn create_genesis_block_with_declarations(
         ops.push(Op::SDPDeclare(declaration));
     }
 
+<<<<<<< HEAD:tests/src/topology/configs/consensus.rs
+    let mantle_tx = MantleTx {
+        ops,
+        execution_gas_price: 0.into(),
+        storage_gas_price: 0.into(),
+    };
+=======
     let mantle_tx = MantleTx(Ops::new_unchecked(ops));
+>>>>>>> 2e5b914dce34e673ee20320d14d00d20cb0b418c:tools/config/src/consensus.rs
 
     let mantle_tx_hash = mantle_tx.hash();
     let mut ops_proofs = vec![
