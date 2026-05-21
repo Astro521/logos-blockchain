@@ -1,0 +1,53 @@
+[package]
+categories  = { workspace = true }
+description = { workspace = true }
+edition     = { workspace = true }
+keywords    = { workspace = true }
+license     = { workspace = true }
+name        = "logos-blockchain-libp2p"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+backon = { features = ["tokio-sleep"], workspace = true }
+blake2 = { workspace = true }
+either = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+igd-next = { features = ["aio_tokio", "tokio"], workspace = true }
+lb-cryptarchia-sync = { workspace = true }
+lb-log-targets = { workspace = true }
+lb-utils = { features = ["time"], workspace = true }
+libp2p = { features = [
+  "autonat",
+  "dns",
+  "gossipsub",
+  "identify",
+  "kad",
+  "macros",
+  "quic",
+  "secp256k1",
+  "serde",
+  "tokio",
+], workspace = true }
+multiaddr = { workspace = true }
+natpmp = { features = ["tokio"], workspace = true }
+netdev = { workspace = true }
+num_enum = { workspace = true }
+rand = { workspace = true }
+serde = { features = ["derive"], workspace = true }
+serde_with = { workspace = true }
+thiserror = { workspace = true }
+tokio = { features = ["macros", "test-util", "time"], workspace = true }
+tracing = { workspace = true }
+zerocopy = { features = ["derive"], workspace = true }
+
+[dev-dependencies]
+libp2p-swarm-test  = { features = ["tokio"], workspace = true }
+serde_json         = { workspace = true }
+tracing-subscriber = { features = ["env-filter", "fmt"], workspace = true }

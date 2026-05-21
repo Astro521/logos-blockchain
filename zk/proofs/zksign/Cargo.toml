@@ -1,0 +1,34 @@
+[package]
+categories  = { workspace = true }
+description = { workspace = true }
+edition     = { workspace = true }
+keywords    = { workspace = true }
+license     = { workspace = true }
+name        = "logos-blockchain-zksign"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+lb-circuits-prover   = { workspace = true }
+lb-circuits-utils    = { workspace = true }
+lb-groth16           = { workspace = true }
+lb-poseidon2         = { workspace = true }
+lb-witness-generator = { workspace = true }
+lbp-error            = { workspace = true }
+num-bigint           = { workspace = true }
+serde                = { features = ["derive"], workspace = true }
+serde_json           = { workspace = true }
+thiserror            = { workspace = true }
+tracing              = { workspace = true }
+
+[dev-dependencies]
+lb-poseidon2 = { workspace = true }
+num-bigint   = { workspace = true }
+rand         = { workspace = true }
+
+[build-dependencies]
+lb-circuits-utils = { workspace = true }
+
+[lints]
+workspace = true

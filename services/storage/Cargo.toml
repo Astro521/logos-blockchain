@@ -1,0 +1,39 @@
+[package]
+categories  = { workspace = true }
+description = { workspace = true }
+edition     = { workspace = true }
+keywords    = { workspace = true }
+license     = { workspace = true }
+name        = "logos-blockchain-storage-service"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait           = { workspace = true }
+bytes                 = { features = ["serde"], workspace = true }
+futures               = { workspace = true }
+lb-core               = { workspace = true }
+lb-cryptarchia-engine = { workspace = true }
+lb-tracing            = { workspace = true }
+overwatch             = { workspace = true }
+rocksdb               = { features = ["bindgen-runtime"], optional = true, workspace = true }
+serde                 = { workspace = true }
+thiserror             = { workspace = true }
+tokio                 = { workspace = true }
+tracing               = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default         = []
+rocksdb-backend = ["dep:rocksdb"]
+
+[[bin]]
+name              = "logos-blockchain-rocksdb"
+path              = "src/bin/rocks.rs"
+required-features = ["rocksdb-backend"]

@@ -1,51 +1,55 @@
 on:
-  pull_request:
-  push:
-    branches:
-      - master
+  schedule:
+    - cron: '0 3 * * *'
+
+  workflow_dispatch:
 
 name: Codecov
 
 jobs:
   test:
-    name: Test
     env:
-      RUSTFLAGS: -C instrument-coverage
-    runs-on: ubuntu-latest
+      CARGO_INCREMENTAL: 0
+      RUSTFLAGS: "-C instrument-coverage"
+      LLVM_PROFILE_FILE: "logos-blockchain-node-%p-%m.profraw"
+    runs-on: self-hosted
     steps:
-      - uses: actions/checkout@v3
-        with:
-          submodules: true
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Checkout submodules
-        run: git submodule update --init --recursive 
-      - uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-          components: llvm-tools-preview
-      - uses: actions-rs/cargo@v1
+      - name: Checkout repository
+        uses: actions/checkout@85e6279cec87321a52edac9c87bce653a07cf6c2  # Version 4.2.2
+      - name: Add llvm-tools-preview component
+        run: rustup component add llvm-tools-preview
+      - name: Build required binaries
+        uses: actions-rs/cargo@9e120dd99b0fbad1c065f686657e914e76bd7b72  # Version 1.0.1
         with:
           command: build
-          args: --all --no-default-features --features libp2p
-      - uses: actions-rs/cargo@v1
-        continue-on-error: true
-      - run: |
-          cargo install grcov;
-          cargo test --no-default-features --features libp2p
-          mkdir /tmp/cov;
-          grcov . --binary-path ./target/debug/ -s . -t lcov --branch --ignore-not-existing --ignore '../*' --ignore "/*" -o /tmp/cov/tests.lcov;
+          args: --all-features -p logos-blockchain-node
+      - name: Run tests
+        uses: actions-rs/cargo@9e120dd99b0fbad1c065f686657e914e76bd7b72  # Version 1.0.1
         env:
-          SLOW_TEST_ENV: true
-      - uses: actions/upload-artifact@v3
+          LOGOS_BLOCKCHAIN_NODE_BIN: ${{ github.workspace }}/target/debug/logos-blockchain-node
+          LOGOS_BLOCKCHAIN_KZGRS_PARAMS_PATH: ${{ github.workspace }}/tests/kzgrs
+        with:
+          command: test
+          args: --all --all-features
+      - name: Run Grcov
+        run: |
+          rm -rf /tmp/coverage 
+          cargo binstall -y grcov;
+          mkdir /tmp/coverage;
+          grcov . --binary-path ./target/debug -s . -t lcov --branch --ignore-not-existing --ignore '../*' --ignore "/*" -o /tmp/coverage/tests.lcov;
+      - name: Upload integration tests results
+        uses: actions/upload-artifact@6027e3dd177782cd8ab9af838c04fd81a07f1d47 # Version 4.6.2
         if: failure()
         with:
           name: integration-test-artifacts
-          path: tests/.tmp*
-      - uses: codecov/codecov-action@v3
+          path: tests/.run_*
+      - name: Run codecov analysis
+        uses: codecov/codecov-action@ea99328d1c4d5f39fda7cbffe104afd6906c50b0  # Version 5.4.0
         with:
-          directory: /tmp/cov/
-          name: nomos-node-codecov
+          directory: /tmp/coverage/
+          name: logos-blockchain-node-codecov
+      - name: Clean up build artifacts
+        if: success() || failure()
+        uses: actions-rs/cargo@9e120dd99b0fbad1c065f686657e914e76bd7b72  # Version 1.0.1
+        with:
+          command: clean

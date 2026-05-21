@@ -1,14 +1,12 @@
-# Docker Compose Testnet for Nomos
+# Docker Compose Testnet for Logos Blockchain
 
-The Nomos Docker Compose Testnet contains four distinct service types:
+The Logos blockchain Docker Compose Testnet contains four distinct service types:
 
-- **Bootstrap Node Service**: A singular Nomos node with its own service and a deterministic DNS address. Other nodes utilize this as their initial peer.
-- **Libp2p Node Services**: Multiple dynamically spawned Nomos nodes that announce their existence through etcd.
-- **Etcd Service**: A container running an etcd instance.
+- **Logos Blockchain Node Services**: Multiple dynamically spawned Logos blockchain nodes that synchronizes their configuration via cfgsync utility.
 
 ## Building
 
-Upon making modifications to the codebase or the Dockerfile, the Nomos images must be rebuilt:
+Upon making modifications to the codebase or the Dockerfile, the Logos blockchain images must be rebuilt:
 
 ```bash
 docker compose build
@@ -18,7 +16,7 @@ docker compose build
 
 Configuration of the Docker testnet is accomplished using the `.env` file. An example configuration can be found in `.env.example`.
 
-To adjust the count of Nomos nodes, modify the variable:
+To adjust the count of Logos blockchain nodes, modify the variable:
 
 ```bash
 DOCKER_COMPOSE_LIBP2P_REPLICAS=100
@@ -41,17 +39,17 @@ docker compose up -d
 Followed by:
 
 ```bash
-docker compose logs -f {bootstrap,libp2p-node,etcd}
+docker compose logs -f logos-blockchain-node
 ```
 
 ## Using testnet
 
-Bootstrap node is accessible from the host via `3000` and `18080` ports. To expose other nomos nodes, please update `libp2p-node` service in the `compose.yml` file with this configuration:
+Bootstrap node is accessible from the host via `3000` and `18080` ports. To expose other Logos blockchain nodes, please update `logos-blockchain-node` service in the `compose.yml` file with this configuration:
 
 ```bash
-  libp2p-node:
+  logos-blockchain-node-0:
     ports:
-    - "3001-3010:3000" # Use range depending on the number of nomos node replicas.
+    - "3001-3010:3000" # Use range depending on the number of Logos blockchain node replicas.
     - "18081-18190:18080"
 ```
 

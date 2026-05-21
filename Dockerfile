@@ -1,28 +1,43 @@
-# BUILD IMAGE ---------------------------------------------------------
+# syntax=docker/dockerfile:1
+# check=skip=SecretsUsedInArgOrEnv
+# Ignore warnings about sensitive information as this is test data.
 
-FROM rust:1.80.0-slim-bullseye AS builder
+ARG LB_CIRCUITS_VERSION=v0.4.2
+ARG LB_NODE_VERSION=0.1.3
 
-WORKDIR /nomos
-COPY . . 
+# ===========================
+# BUILD IMAGE
+# ===========================
 
-# Install dependencies needed for building RocksDB.
-RUN apt-get update && apt-get install -yq \
-    git clang libssl-dev pkg-config protobuf-compiler
+FROM alpine:latest AS builder
 
-RUN cargo build --release -p nomos-node
+ARG LB_CIRCUITS_VERSION
+ARG LB_NODE_VERSION
 
-# NODE IMAGE ----------------------------------------------------------
+WORKDIR /logos-blockchain
+COPY . .
 
-FROM bitnami/minideb:latest
+RUN apk add --no-cache curl bash
+RUN scripts/setup-logos-blockchain-circuits.sh "$LB_CIRCUITS_VERSION" "/opt/circuits"
+RUN scripts/setup-logos-blockchain-node.sh "$LB_NODE_VERSION" "linux-$(uname -m)"
+
+# ===========================
+# NODE IMAGE
+# ===========================
+
+FROM debian:trixie-slim
+
+ARG LB_CIRCUITS_VERSION
 
 LABEL maintainer="augustinas@status.im" \
-      source="https://github.com/logos-co/nomos-node" \
-      description="Nomos node image"
+    source="https://github.com/logos-blockchain/logos-blockchain" \
+    description="Logos blockchain node image"
 
-# nomos default ports
-EXPOSE 3000 8080 9000 60000	
+COPY --from=builder /opt/circuits /opt/circuits
+COPY --from=builder /usr/local/bin/logos-blockchain-node /usr/local/bin/logos-blockchain-node
 
-COPY --from=builder /nomos/target/release/nomos-node /usr/bin/nomos-node
-COPY nodes/nomos-node/config.yaml /etc/nomos/config.yaml
+ENV LOGOS_BLOCKCHAIN_CIRCUITS=/opt/circuits
 
-ENTRYPOINT ["nomos-node"]
+EXPOSE 3000 8080 9000 60000
+
+ENTRYPOINT ["logos-blockchain-node"]
