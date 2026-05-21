@@ -1,31 +1,52 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 use cucumber::{gherkin::Step, given, then, when};
+use lb_common_http_client::CommonHttpClient;
+use lb_core::codec::DeserializeOp as _;
+use lb_key_management_system_service::keys::ZkPublicKey;
 use lb_libp2p::{Multiaddr, PeerId};
-use lb_testing_framework::{DeploymentBuilder, LbcLocalDeployer, TopologyConfig};
+use lb_testing_framework::USER_CONFIG_FILE;
 use tokio::time::{Instant, sleep};
 use tracing::{info, warn};
 
-use crate::cucumber::{
-    error::{StepError, StepResult},
-    steps::{
-        TARGET,
-        manual_cluster::{build_manual_cluster_deployment, stop_active_manual_cluster},
-        manual_nodes::{
-            snapshots::{save_named_blockchain_snapshot, validate_snapshot_path_component},
-            utils::{
-                NodesToStartUnordered, create_snapshots_all_nodes, get_cryptarchia_info_all_nodes,
-                nodes_converged, parse_genesis_wallet_tokens_row, parse_url,
-                parse_wallet_resources_table_row, poll_all_nodes_and_update_consensus_cache,
-                restart_node, start_node, start_nodes_order_respecting_dependencies,
-                verify_genesis_wallet_resources_table_indexes,
-                verify_node_wallet_resources_table_indexes,
-                wait_for_all_nodes_to_be_synced_to_chain,
+use crate::{
+    cucumber::{
+        error::{StepError, StepResult},
+        steps::{
+            TARGET,
+            manual_cluster::{
+                assert_manual_node_has_peers, connect_manual_node_to_node,
+                install_local_manual_cluster, rebuild_pending_local_manual_cluster,
+                stop_active_manual_cluster,
+            },
+            manual_nodes::{
+                config_override::{set_deployment_config_override, set_user_config_override},
+                snapshots::{save_named_blockchain_snapshot, validate_snapshot_path_component},
+                utils::{
+                    NodesToStartUnordered, create_snapshots_all_nodes,
+                    ensure_all_nodes_agree_on_lib,
+                    ensure_fee_sponsorship_and_fork_groups_are_not_mixed,
+                    get_cryptarchia_info_all_nodes, nodes_converged,
+                    parse_genesis_wallet_tokens_row, parse_url, parse_wallet_resources_table_row,
+                    poll_all_nodes_and_update_consensus_cache, restart_node, start_node,
+                    start_nodes_order_respecting_dependencies,
+                    verify_genesis_wallet_resources_table_indexes,
+                    verify_node_wallet_resources_table_indexes,
+                    verify_reponsive_and_network_ready_with_timeout, wait_all_nodes_responive,
+                    wait_for_all_nodes_to_be_synced_to_chain,
+                },
+            },
+            manual_transactions::utils::{
+                create_and_submit_transaction_hashes, wait_for_transactions_inclusion,
             },
         },
+        utils::{blend_core_zk_pk_from_node_yaml, resolve_literal_or_env},
+        world::{
+            CucumberWorld, GenesisTokens, ManualClusterKind, ManualClusterSpec, NodeSnapshot,
+            PublicCryptarchiaEndpointPeer,
+        },
     },
-    utils::resolve_literal_or_env,
-    world::{CucumberWorld, GenesisTokens, NodeSnapshot, PublicCryptarchiaEndpointPeer},
+    non_zero,
 };
 
 const PUBLIC_CRYPTARCHIA_ENDPOINT: &str = "public_cryptarchia_endpoint";
@@ -35,14 +56,16 @@ const PUBLIC_CRYPTARCHIA_ENDPOINT_PASSWORD: &str = "password";
 #[given(expr = "I have a cluster with capacity of {int} nodes")]
 #[when(expr = "I have a cluster with capacity of {int} nodes")]
 fn step_manual_cluster(world: &mut CucumberWorld, step: &Step, nodes_count: usize) -> StepResult {
-    let deployment = build_manual_cluster_deployment(world, nodes_count).inspect_err(|e| {
+    install_local_manual_cluster(
+        world,
+        ManualClusterSpec {
+            kind: ManualClusterKind::Generated,
+            capacity: nodes_count,
+        },
+    )
+    .inspect_err(|e| {
         warn!(target: TARGET, "Step '{step}' error: {e}");
-    })?;
-    let deployer = LbcLocalDeployer::new();
-    let cluster = deployer.manual_cluster_from_descriptors(deployment);
-    world.local_cluster = Some(cluster);
-
-    Ok(())
+    })
 }
 
 #[given(expr = "I have a devnet cluster with capacity of {int} nodes")]
@@ -52,37 +75,16 @@ fn step_manual_devnet_cluster(
     step: &Step,
     nodes_count: usize,
 ) -> StepResult {
-    // For devnet runs we do NOT allocate genesis tokens/accounts here.
-    // Wallet keys are derived later (compile_wallet_in_map), and the node RunConfig
-    // is switched to Devnet via `join_external_network` inside
-    // `prepare_config_patch`.
-
-    world.genesis_block_utxos.clear();
-    world.wallet_accounts.clear();
-
-    let config = TopologyConfig::with_node_numbers(nodes_count)
-        .with_allow_multiple_genesis_tokens(true)
-        .with_allow_zero_value_genesis_tokens(true);
-
-    let deployment = match DeploymentBuilder::new(config).build() {
-        Ok(deployment) => deployment,
-        Err(e) => {
-            warn!(target: TARGET, "Step '{step}' error: {e}");
-            return Err(StepError::LogicalError {
-                message: format!("failed to build devnet manual cluster: {e}"),
-            });
-        }
-    };
-
-    // NOTE: We intentionally do NOT call `genesis_block_utxos(&genesis_tx)` here.
-    // In devnet mode the node will switch deployment settings at start, and local
-    // generated genesis outputs are not meaningful for wallet tracking.
-
-    let deployer = LbcLocalDeployer::new();
-    let cluster = deployer.manual_cluster_from_descriptors(deployment);
-    world.local_cluster = Some(cluster);
-
-    Ok(())
+    install_local_manual_cluster(
+        world,
+        ManualClusterSpec {
+            kind: ManualClusterKind::Devnet,
+            capacity: nodes_count,
+        },
+    )
+    .inspect_err(|e| {
+        warn!(target: TARGET, "Step '{step}' error: {e}");
+    })
 }
 
 #[given("the genesis block has the following wallet resources:")]
@@ -109,6 +111,25 @@ fn step_cluster_has_wallet_resources(world: &mut CucumberWorld, step: &Step) -> 
         });
     }
 
+    Ok(())
+}
+
+#[given(expr = "we have a sponsored genesis fee account with {int} tokens of {int} value each")]
+#[when(expr = "we have a sponsored genesis fee account with {int} tokens of {int} value each")]
+fn step_sponsored_genesis_fee_account(
+    world: &mut CucumberWorld,
+    step: &Step,
+    token_count: usize,
+    token_value: u64,
+) -> StepResult {
+    ensure_fee_sponsorship_and_fork_groups_are_not_mixed(world, step.value.as_str())?;
+
+    let token_count = non_zero!("genesis fee token count", token_count)?;
+    let token_value = non_zero!("genesis fee token value", token_value)?;
+
+    world
+        .fee_state
+        .set_sponsored_genesis_account(token_count, token_value);
     Ok(())
 }
 
@@ -154,6 +175,7 @@ async fn step_start_nodes_with_wallet_resources(
             &node_name,
             &wallet_start_info,
             &initial_peers,
+            false,
         )
         .await?;
     }
@@ -168,7 +190,147 @@ async fn step_start_manual_stand_alone_node(
     step: &Step,
     node_name: String,
 ) -> StepResult {
-    start_node(world, &step.value, &node_name, &Vec::new(), &Vec::new()).await
+    start_node(
+        world,
+        &step.value,
+        &node_name,
+        &Vec::new(),
+        &Vec::new(),
+        false,
+    )
+    .await
+}
+
+#[given(expr = "I immediate start node {string}")]
+#[when(expr = "I immediate start node {string}")]
+async fn step_start_manual_network_ready_only_stand_alone_node(
+    world: &mut CucumberWorld,
+    step: &Step,
+    node_name: String,
+) -> StepResult {
+    start_node(
+        world,
+        &step.value,
+        &node_name,
+        &Vec::new(),
+        &Vec::new(),
+        true,
+    )
+    .await
+}
+
+#[when(expr = "I start node {string} to be ready between {int} and {int} seconds")]
+async fn step_start_manual_stand_alone_node_not_ready_before(
+    world: &mut CucumberWorld,
+    step: &Step,
+    node_name: String,
+    min_wait_seconds: u64,
+    max_wait_seconds: u64,
+) -> StepResult {
+    let start = Instant::now();
+    start_node(
+        world,
+        &step.value,
+        &node_name,
+        &Vec::new(),
+        &Vec::new(),
+        false,
+    )
+    .await?;
+
+    let elapsed = start.elapsed();
+    if elapsed < Duration::from_secs(min_wait_seconds) {
+        return Err(StepError::StepFail {
+            message: format!(
+                "Step `{}` error: Node '{node_name}' became ready too early: elapsed {:.2?}, \
+                expected at least {min_wait_seconds}s",
+                step.value, elapsed,
+            ),
+        });
+    }
+    if elapsed > Duration::from_secs(max_wait_seconds) {
+        return Err(StepError::StepFail {
+            message: format!(
+                "Step `{}` error: Node '{node_name}' took too long to become ready: elapsed {:.2?}, \
+                expected at most {max_wait_seconds}s",
+                step.value, elapsed,
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+#[when(
+    expr = "I start peer node {string} connected to node {string} to be ready between {int} and {int} seconds"
+)]
+async fn step_start_manual_peer_node_not_ready_before(
+    world: &mut CucumberWorld,
+    step: &Step,
+    node_name: String,
+    peer_name: String,
+    min_wait_seconds: u64,
+    max_wait_seconds: u64,
+) -> StepResult {
+    let start = Instant::now();
+    start_node(
+        world,
+        &step.value,
+        &node_name,
+        &Vec::new(),
+        &[peer_name],
+        false,
+    )
+    .await?;
+
+    let elapsed = start.elapsed();
+    if elapsed < Duration::from_secs(min_wait_seconds) {
+        return Err(StepError::StepFail {
+            message: format!(
+                "Step `{}` error: Node '{node_name}' became ready too early: elapsed {:.2?}, \
+                expected at least {min_wait_seconds}s",
+                step.value, elapsed,
+            ),
+        });
+    }
+    if elapsed > Duration::from_secs(max_wait_seconds) {
+        return Err(StepError::StepFail {
+            message: format!(
+                "Step `{}` error: Node '{node_name}' took too long to become ready: elapsed {:.2?}, \
+                expected at most {max_wait_seconds}s",
+                step.value, elapsed,
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+#[when(expr = "I connect node {string} to node {string} at runtime")]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Cucumber step entrypoints must take `&mut World`"
+)]
+async fn step_connect_nodes_at_runtime(
+    world: &mut CucumberWorld,
+    source_node_name: String,
+    target_node_name: String,
+) -> StepResult {
+    connect_manual_node_to_node(world, &source_node_name, &target_node_name).await
+}
+
+#[then(expr = "node {string} has at least {int} peers within {int} seconds")]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Cucumber step entrypoints must take `&mut World`"
+)]
+async fn step_node_has_peers(
+    world: &mut CucumberWorld,
+    node_name: String,
+    min_peers: usize,
+    timeout_secs: u64,
+) -> StepResult {
+    assert_manual_node_has_peers(world, &node_name, min_peers, timeout_secs).await
 }
 
 #[when(expr = "I restart node {string}")]
@@ -194,6 +356,103 @@ const fn step_we_use_ibd_peers(world: &mut CucumberWorld) {
 #[when(expr = "we join an external network")]
 const fn step_we_join_external_network(world: &mut CucumberWorld) {
     world.join_external_network = Some(true);
+}
+
+#[given(expr = "we will have distinct node groups to query wallet balances:")]
+#[when(expr = "we will have distinct node groups to query wallet balances:")]
+fn step_define_node_groups(world: &mut CucumberWorld, step: &Step) -> Result<(), StepError> {
+    ensure_fee_sponsorship_and_fork_groups_are_not_mixed(world, &step.value)?;
+
+    let table = step.table.as_ref().ok_or(StepError::LogicalError {
+        message: "Expected a data table".to_owned(),
+    })?;
+
+    if table.rows.is_empty() || table.rows[0].len() != 2 {
+        return Err(StepError::LogicalError {
+            message: "Expected table columns: | group_name | node_name |".to_owned(),
+        });
+    }
+
+    if table.rows[0][0].trim() != "group_name" || table.rows[0][1].trim() != "node_name" {
+        return Err(StepError::LogicalError {
+            message: "Expected table columns: | group_name | node_name |".to_owned(),
+        });
+    }
+
+    world.node_groups.clear();
+    world.node_to_group.clear();
+
+    for row in table.rows.iter().skip(1) {
+        if row.len() != 2 {
+            return Err(StepError::LogicalError {
+                message: "Each node-group row must have exactly two columns".to_owned(),
+            });
+        }
+
+        let group_name = row[0].trim().to_owned();
+        let node_name = row[1].trim().to_owned();
+
+        if let Some(existing_group) = world.node_to_group.get(&node_name) {
+            return Err(StepError::LogicalError {
+                message: format!(
+                    "Node `{node_name}` appears in both group `{existing_group}` and `{group_name}`"
+                ),
+            });
+        }
+
+        world
+            .node_groups
+            .entry(group_name.clone())
+            .or_default()
+            .insert(node_name.clone());
+        world.node_to_group.insert(node_name, group_name);
+    }
+
+    Ok(())
+}
+
+#[given(expr = "I have user config override {string} as {string}")]
+#[when(expr = "I have user config override {string} as {string}")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Required by cucumber expression"
+)]
+fn step_set_user_config_setting(
+    world: &mut CucumberWorld,
+    step: &Step,
+    setting_path: String,
+    setting_value: String,
+) -> StepResult {
+    set_user_config_override(world, &step.value, &setting_path, &setting_value)
+}
+
+#[given(expr = "I have deployment config override {string} as {string}")]
+#[when(expr = "I have deployment config override {string} as {string}")]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Required by cucumber expression"
+)]
+fn step_set_deployment_config_setting(
+    world: &mut CucumberWorld,
+    step: &Step,
+    setting_path: String,
+    setting_value: String,
+) -> StepResult {
+    set_deployment_config_override(world, &step.value, &setting_path, &setting_value)
+}
+
+#[given(expr = "the first {int} nodes are declared as blend providers")]
+#[when(expr = "the first {int} nodes are declared as blend providers")]
+fn step_blend_provider_count(world: &mut CucumberWorld, provider_count: usize) -> StepResult {
+    world.blend_core_nodes = Some(provider_count);
+    rebuild_pending_local_manual_cluster(world)
+}
+
+#[given(expr = "no nodes are declared as blend providers")]
+#[when(expr = "no nodes are declared as blend providers")]
+fn step_no_blend_providers(world: &mut CucumberWorld) -> StepResult {
+    world.blend_core_nodes = Some(0);
+    rebuild_pending_local_manual_cluster(world)
 }
 
 #[given(expr = "I will create a blockchain snapshot {string} of all nodes when stopping")]
@@ -476,7 +735,34 @@ async fn step_start_manual_connected_node(
     node_name: String,
     peer_name: String,
 ) -> StepResult {
-    start_node(world, &step.value, &node_name, &Vec::new(), &[peer_name]).await
+    start_node(
+        world,
+        &step.value,
+        &node_name,
+        &Vec::new(),
+        &[peer_name],
+        false,
+    )
+    .await
+}
+
+#[given(expr = "I immediate start peer node {string} connected to node {string}")]
+#[when(expr = "I immediate start peer node {string} connected to node {string}")]
+async fn step_immediate_start_manual_connected_node(
+    world: &mut CucumberWorld,
+    step: &Step,
+    node_name: String,
+    peer_name: String,
+) -> StepResult {
+    start_node(
+        world,
+        &step.value,
+        &node_name,
+        &Vec::new(),
+        &[peer_name],
+        true,
+    )
+    .await
 }
 
 #[given(expr = "I start peer node {string} connected to node {string} and node {string}")]
@@ -494,8 +780,76 @@ async fn step_start_manual_two_connected_nodes(
         &node_name,
         &Vec::new(),
         &[peer_name1, peer_name2],
+        false,
     )
     .await
+}
+
+#[given(expr = "I immediate start peer node {string} connected to node {string} and node {string}")]
+#[when(expr = "I immediate start peer node {string} connected to node {string} and node {string}")]
+async fn step_immediate_start_manual_two_connected_nodes(
+    world: &mut CucumberWorld,
+    step: &Step,
+    node_name: String,
+    peer_name1: String,
+    peer_name2: String,
+) -> StepResult {
+    start_node(
+        world,
+        &step.value,
+        &node_name,
+        &Vec::new(),
+        &[peer_name1, peer_name2],
+        true,
+    )
+    .await
+}
+
+#[when(expr = "I wait for all nodes to be responsive in {int} seconds")]
+#[then(expr = "I wait for all nodes to be responsive in {int} seconds")]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Cucumber step functions require the world as the first `&mut` argument"
+)]
+async fn step_wait_all_nodes_responsive(
+    world: &mut CucumberWorld,
+    step: &Step,
+    time_out_seconds: u64,
+) -> StepResult {
+    let cluster = world
+        .local_cluster
+        .as_ref()
+        .ok_or(StepError::LogicalError {
+            message: "No local cluster available".into(),
+        })?;
+    if let Err(e) = wait_all_nodes_responive(cluster, Duration::from_secs(time_out_seconds)).await {
+        return Err(StepError::StepFail {
+            message: format!("Step `{}` error: {e}", step.value),
+        });
+    }
+
+    let wait_tasks: Vec<_> = world
+        .nodes_info
+        .values()
+        .map(|node| {
+            let fut = verify_reponsive_and_network_ready_with_timeout(
+                &node.started_node.client,
+                &node.name,
+                &node.started_node.name,
+                Duration::from_secs(time_out_seconds),
+            );
+            let step_value = step.value.clone();
+            async move {
+                fut.await.map_err(|e| StepError::StepFail {
+                    message: format!("Step `{step_value}` error: {e}"),
+                })
+            }
+        })
+        .collect();
+
+    futures::future::try_join_all(wait_tasks).await?;
+
+    Ok(())
 }
 
 #[when(expr = "node {string} is at height {int} in {int} seconds")]
@@ -542,6 +896,27 @@ async fn step_node_is_at_height(
     }
 }
 
+#[when(expr = "node {string} is exactly at height")]
+#[then(expr = "node {string} is exactly at height")]
+async fn step_node_is_exactly_at_height(
+    world: &mut CucumberWorld,
+    step: &Step,
+    node_name: String,
+    height: u64,
+) -> StepResult {
+    poll_all_nodes_and_update_consensus_cache(&step.value, &mut world.nodes_info).await?;
+    let node_height = world.node_best_height(&node_name)?.unwrap_or_default();
+    if node_height != height {
+        return Err(StepError::StepFail {
+            message: format!(
+                "Step `{}` error: Node '{node_name}' is at height {node_height}, required {height}",
+                step.value
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[when(expr = "all nodes converged to within {int} blocks in {int} seconds")]
 #[then(expr = "all nodes converged to within {int} blocks in {int} seconds")]
 async fn step_all_nodes_converged(
@@ -574,6 +949,20 @@ async fn step_all_nodes_reached_min_height_and_converged(
         time_out_seconds,
     )
     .await
+}
+
+#[when(expr = "all nodes agree on LIB in {int} seconds")]
+#[then(expr = "all nodes agree on LIB in {int} seconds")]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Cucumber step functions require the world as the first `&mut` argument"
+)]
+async fn step_all_nodes_agree_on_lib(
+    world: &mut CucumberWorld,
+    step: &Step,
+    time_out_seconds: u64,
+) -> StepResult {
+    ensure_all_nodes_agree_on_lib(world, &step.value, time_out_seconds).await
 }
 
 #[when("I wait for all nodes to be synced to the chain")]
@@ -617,6 +1006,288 @@ fn step_stop_all_nodes(world: &mut CucumberWorld) -> StepResult {
         info!(target: TARGET, "Stopping node '{node_name}'");
     }
     world.nodes_info.clear();
+
+    Ok(())
+}
+
+#[when(
+    expr = "I send {int} transactions of {int} LGO each from wallet {string} to blend core zk key of node {string}"
+)]
+async fn step_send_multiple_transactions_to_blend_core_zk_key(
+    world: &mut CucumberWorld,
+    step: &Step,
+    number_of_transactions: usize,
+    output_value: u64,
+    sender_wallet_name: String,
+    receiver_node_name: String,
+) -> StepResult {
+    let receiver_blend_zk_pk = blend_zk_pk_for_node(world, &receiver_node_name)?;
+    let sender_node_name = world.resolve_wallet(&sender_wallet_name)?.node_name;
+    let sender_node_client = world
+        .nodes_info
+        .get(&sender_node_name)
+        .ok_or_else(|| StepError::LogicalError {
+            message: format!("Node '{sender_node_name}' not found in world state"),
+        })?
+        .started_node
+        .client
+        .clone();
+
+    for _ in 0..number_of_transactions {
+        let tx_hashes = create_and_submit_transaction_hashes(
+            world,
+            &step.value,
+            &sender_wallet_name,
+            &[(receiver_blend_zk_pk, output_value)],
+            None,
+        )
+        .await
+        .inspect_err(|error| {
+            warn!(target: TARGET, "Step `{}` error: {error}", step.value);
+        })?;
+
+        wait_for_transactions_inclusion(&sender_node_client, &tx_hashes, Duration::from_mins(2))
+            .await
+            .inspect_err(|error| {
+                warn!(target: TARGET, "Step `{}` error: {error}", step.value);
+            })?;
+
+        info!(
+            target: TARGET,
+            "Sent and included normal transaction from `{sender_wallet_name}` to blend zk key of {receiver_node_name}, value: {output_value}, tx count: {}",
+            tx_hashes.len(),
+        );
+    }
+
+    Ok(())
+}
+
+fn blend_zk_pk_for_node(world: &CucumberWorld, node_name: &str) -> Result<ZkPublicKey, StepError> {
+    let node_info = world
+        .nodes_info
+        .get(node_name)
+        .ok_or_else(|| StepError::LogicalError {
+            message: format!("Node '{node_name}' not found in world state"),
+        })?;
+
+    let user_config_path = node_info.runtime_dir.join(USER_CONFIG_FILE);
+    let blend_zk_pk_hex = blend_core_zk_pk_from_node_yaml(&user_config_path)?;
+    let blend_zk_pk = ZkPublicKey::from_bytes(&hex::decode(blend_zk_pk_hex)?)?;
+
+    Ok(blend_zk_pk)
+}
+
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Required to be mutable by cucumber step function signature"
+)]
+#[expect(unused_variables, reason = "Cucumber step function signature")]
+#[then(expr = "I declare node {string} as blend core node via the CLI binary")]
+async fn step_run_blend_sdp_declaration_cli(
+    world: &mut CucumberWorld,
+    step: &Step,
+    declarer_node_name: String,
+) -> StepResult {
+    let user_config_path = node_user_config_path(world, &declarer_node_name)?;
+    let blend_zk_pk = blend_zk_pk_for_node(world, &declarer_node_name)?;
+
+    let declarer_api_base_url = world
+        .nodes_info
+        .get(&declarer_node_name)
+        .ok_or_else(|| StepError::LogicalError {
+            message: format!("Node '{declarer_node_name}' not found in world state"),
+        })?
+        .started_node
+        .client
+        .base_url()
+        .clone();
+
+    // Query notes from the declarer node API so wallet ownership lookups use
+    // the same node config as the key source.
+    let note_lookup_timeout = Duration::from_secs(30);
+    let note_lookup_started = Instant::now();
+    let mut last_lookup_error: Option<String>;
+    let locked_note_id = loop {
+        let Ok(wallet_balance) = CommonHttpClient::new(None)
+            .get_wallet_balance(declarer_api_base_url.clone(), blend_zk_pk, None)
+            .await
+        else {
+            continue;
+        };
+        if let Some(note_id) = wallet_balance.notes.keys().next().copied() {
+            let locked_note_id_json =
+                serde_json::to_string(&note_id).map_err(|error| StepError::LogicalError {
+                    message: format!("Failed to serialize locked note ID: {error}"),
+                })?;
+            let locked_note_id_hex = locked_note_id_json.trim_matches('"').to_owned();
+            break locked_note_id_hex;
+        }
+        last_lookup_error = Some("wallet has no notes yet".to_owned());
+
+        if note_lookup_started.elapsed() >= note_lookup_timeout {
+            return Err(StepError::Timeout {
+                message: format!(
+                    "Timed out waiting for a funded note on Blend ZK key of '{declarer_node_name}' via '{}' (last error: {})",
+                    declarer_api_base_url,
+                    last_lookup_error.unwrap_or_else(|| "unknown".to_owned())
+                ),
+            });
+        }
+
+        sleep(Duration::from_millis(250)).await;
+    };
+
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let output = tokio::process::Command::new("cargo")
+        .current_dir(workspace_root)
+        .arg("run")
+        .arg("-p")
+        .arg("logos-blockchain-tools")
+        .arg("--bin")
+        .arg("logos-blockchain-tools-api")
+        .arg("--")
+        .arg("sdp")
+        .arg("post-blend-declaration")
+        .arg("--user-config-path")
+        .arg(user_config_path)
+        .arg("--locked-note-id")
+        .arg(locked_note_id)
+        .arg("--node-address")
+        .arg(declarer_api_base_url.to_string())
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(StepError::StepFail {
+            message: format!(
+                "Blend declaration CLI failed for node '{declarer_node_name}'\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn node_user_config_path(world: &CucumberWorld, node_name: &str) -> Result<PathBuf, StepError> {
+    let node_info = world
+        .nodes_info
+        .get(node_name)
+        .ok_or_else(|| StepError::LogicalError {
+            message: format!("Node '{node_name}' not found in world state"),
+        })?;
+
+    Ok(node_info.runtime_dir.join(USER_CONFIG_FILE))
+}
+
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "TODO: Address this at some point."
+)]
+#[expect(
+    clippy::needless_pass_by_ref_mut,
+    reason = "Required to be mutable by cucumber step function signature"
+)]
+#[then(expr = "blend core SDP declaration for node {string} is included on node {string}")]
+async fn step_verify_blend_sdp_declaration_included(
+    world: &mut CucumberWorld,
+    step: &Step,
+    declarer_node_name: String,
+    api_node_name: String,
+) -> StepResult {
+    let blend_zk_pk = blend_zk_pk_for_node(world, &declarer_node_name)?;
+
+    let declarer_api_base_url = world
+        .nodes_info
+        .get(&declarer_node_name)
+        .ok_or_else(|| StepError::LogicalError {
+            message: format!("Node '{declarer_node_name}' not found in world state"),
+        })?
+        .started_node
+        .client
+        .base_url()
+        .clone();
+
+    let note_lookup_timeout = Duration::from_secs(30);
+    let note_lookup_started = Instant::now();
+    let mut last_lookup_error: Option<String>;
+    let locked_note_id = loop {
+        let Ok(wallet_balance) = CommonHttpClient::new(None)
+            .get_wallet_balance(declarer_api_base_url.clone(), blend_zk_pk, None)
+            .await
+        else {
+            continue;
+        };
+        if let Some(note_id) = wallet_balance.notes.keys().next().copied() {
+            break note_id;
+        }
+        last_lookup_error = Some("wallet has no notes yet".to_owned());
+
+        if note_lookup_started.elapsed() >= note_lookup_timeout {
+            return Err(StepError::Timeout {
+                message: format!(
+                    "Timed out waiting for a funded note on Blend ZK key of '{declarer_node_name}' via '{}' (last error: {})",
+                    declarer_api_base_url,
+                    last_lookup_error.unwrap_or_else(|| "unknown".to_owned())
+                ),
+            });
+        }
+
+        sleep(Duration::from_millis(250)).await;
+    };
+
+    let step_timeout = Duration::from_secs(30);
+    let start_time = Instant::now();
+    loop {
+        let declarations_result = world
+            .nodes_info
+            .get(&api_node_name)
+            .ok_or_else(|| StepError::LogicalError {
+                message: format!("Node '{api_node_name}' not found in world state"),
+            })?
+            .started_node
+            .client
+            .get_sdp_declarations()
+            .await;
+
+        let declarations = match declarations_result {
+            Ok(declarations) => declarations,
+            Err(error) => {
+                let error_message = error.to_string();
+                if error_message.contains("404 Not Found") {
+                    info!(
+                        target: TARGET,
+                        "Skipping declaration visibility assertion on '{api_node_name}' because testing SDP endpoint is unavailable: {error_message}",
+                    );
+                    return Ok(());
+                }
+
+                warn!(target: TARGET, "Step `{}` error: {error}", step.value);
+                return Err(error.into());
+            }
+        };
+
+        if declarations.iter().any(|declaration| {
+            declaration.locked_note_id == locked_note_id && declaration.zk_id == blend_zk_pk
+        }) {
+            info!(
+                target: TARGET,
+                "Blend declaration observed for node '{declarer_node_name}'"
+            );
+            break;
+        }
+
+        if start_time.elapsed() >= step_timeout {
+            return Err(StepError::Timeout {
+                message: format!(
+                    "Timed out waiting for declaration submitted by '{declarer_node_name}' to appear on node '{api_node_name}'"
+                ),
+            });
+        }
+
+        sleep(Duration::from_millis(250)).await;
+    }
 
     Ok(())
 }

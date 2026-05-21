@@ -3,6 +3,7 @@ use core::{num::NonZeroU64, time::Duration};
 use lb_ledger::mantle::sdp::rewards::blend::RewardsParameters;
 use lb_libp2p::protocol_name::StreamProtocol;
 use lb_utils::math::NonNegativeF64;
+use nutype::nutype;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
@@ -77,7 +78,7 @@ impl Settings {
         self.rounds_per_interval(slots_per_block, slot_duration)
     }
 
-    /// Number of rounds per epoch transition period.
+    /// Number of rounds per session transition period.
     ///
     /// The Blend spec defines this as roughly the same time it takes to propose
     /// a new block.
@@ -124,6 +125,21 @@ pub struct CommonSettings {
     pub minimum_network_size: NonZeroU64,
     pub protocol_name: StreamProtocol,
     pub data_replication_factor: u64,
+}
+
+#[nutype(
+    validate(greater_or_equal = 2),
+    derive(Serialize, Deserialize, Debug, Clone, Copy)
+)]
+pub struct MinimumNetworkSize(u64);
+
+impl From<MinimumNetworkSize> for NonZeroU64 {
+    fn from(value: MinimumNetworkSize) -> Self {
+        value
+            .into_inner()
+            .try_into()
+            .expect("Minimum network size is at least 2, which is > than 0.")
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

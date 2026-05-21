@@ -2,14 +2,14 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use cucumber::gherkin::Table;
-use futures_util::future::try_join_all;
+use futures::future::try_join_all;
 use hex::ToHex as _;
-use lb_chain_service::CryptarchiaInfo;
-use lb_core::mantle::{GenesisTx as _, Transaction as _, Utxo};
+use lb_chain_service::{ChainServiceMode, CryptarchiaInfo, State};
+use lb_core::mantle::{GenesisTx as _, Utxo, ops::OpId as _};
 use lb_http_api_common::paths::CRYPTARCHIA_INFO;
 use lb_libp2p::PeerId;
 use lb_node::config::{DeploymentSettings, RunConfig, WellKnownDeployment};
@@ -19,16 +19,19 @@ use lb_testing_framework::{
 use libp2p::Multiaddr;
 use reqwest::{Client, Url};
 use testing_framework_core::scenario::{PeerSelection, StartNodeOptions, StartedNode};
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant as TokioInstant, sleep, timeout};
 use tracing::{info, warn};
 
 use crate::cucumber::{
     error::{StepError, StepResult},
     steps::{
         TARGET,
-        manual_nodes::snapshots::{
-            restore_node_state_from_snapshot, save_named_blockchain_snapshot,
-            validate_snapshot_path_component,
+        manual_nodes::{
+            config_override::{apply_deployment_config_overrides, apply_user_config_overrides},
+            snapshots::{
+                restore_node_state_from_snapshot, save_named_blockchain_snapshot,
+                validate_snapshot_path_component,
+            },
         },
     },
     utils::{
@@ -36,8 +39,8 @@ use crate::cucumber::{
         matching_child_dirs, peer_id_from_node_yaml, track_progress, truncate_hash,
     },
     world::{
-        ChainInfoMap, CucumberWorld, NodeInfo, PublicCryptarchiaEndpointPeer, WalletInfo,
-        WalletInfoMap, WalletType,
+        ChainInfoMap, ConfigOverride, CucumberWorld, ManualNodeConfigOverrides, NodeInfo,
+        PublicCryptarchiaEndpointPeer, WalletInfo, WalletInfoMap, WalletType,
     },
 };
 
@@ -45,7 +48,7 @@ pub(crate) type NodesToStartUnordered = HashMap<String, (Vec<WalletStartInfo>, V
 type NodesToStartOrdered = Vec<(String, Vec<WalletStartInfo>, Vec<String>)>;
 
 const CHAIN_SYNC_POLL_INTERVAL: Duration = Duration::from_secs(5);
-const CHAIN_SYNC_STATUS_LOG_INTERVAL: Duration = Duration::from_secs(120);
+const CHAIN_SYNC_STATUS_LOG_INTERVAL: Duration = Duration::from_mins(2);
 
 // Returns the root directory for a named snapshot.
 
@@ -104,13 +107,13 @@ pub(crate) fn genesis_block_utxos(
     genesis_tx: &lb_core::mantle::genesis_tx::GenesisTx,
 ) -> Vec<Utxo> {
     let transfer_op = genesis_tx.genesis_transfer().clone();
-    let transfer_hash = transfer_op.hash();
+    let transfer_id = transfer_op.op_id();
 
     transfer_op
         .outputs
         .iter()
         .enumerate()
-        .map(|(idx, note)| Utxo::new(transfer_hash, idx, *note))
+        .map(|(idx, note)| Utxo::new(transfer_id, idx, *note))
         .collect()
 }
 
@@ -277,7 +280,7 @@ pub(crate) fn parse_wallet_resources_table_row(
         .get(CONNECTED_TO_IDX)
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .map(str::to_string);
+        .map(str::to_owned);
 
     Ok((
         node_name,
@@ -287,6 +290,21 @@ pub(crate) fn parse_wallet_resources_table_row(
         },
         connected_to,
     ))
+}
+
+pub(crate) fn ensure_fee_sponsorship_and_fork_groups_are_not_mixed(
+    world: &CucumberWorld,
+    step_value: &str,
+) -> StepResult {
+    if world.fee_state.sponsored_genesis_account.is_some() && !world.node_groups.is_empty() {
+        return Err(StepError::InvalidArgument {
+            message: format!(
+                "Step `{step_value}` error: sponsored fee accounts cannot be combined with distinct node groups in the same scenario"
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 pub(crate) async fn wait_for_all_nodes_to_be_synced_to_chain(
@@ -453,7 +471,7 @@ async fn all_local_nodes_match_sync_target(
         let Ok(consensus) = node_info.started_node.client.consensus_info().await else {
             return false;
         };
-        if SyncTargetStats::from_cryptarchia_info(&consensus) != target.stats {
+        if SyncTargetStats::from_cryptarchia_info(&consensus.cryptarchia_info) != target.stats {
             return false;
         }
     }
@@ -577,6 +595,7 @@ pub async fn start_node(
     node_name: &str,
     wallet_start_info: &[WalletStartInfo],
     initial_peers: &[String],
+    immediate_start: bool,
 ) -> StepResult {
     let cluster = world
         .local_cluster
@@ -602,10 +621,13 @@ pub async fn start_node(
                     prepare_config_patch(
                         &mut config,
                         startup_settings.join_external_network,
-                        &startup_settings.deployment_override,
+                        startup_settings.deployment_settings_override.as_ref(),
+                        &startup_settings.manual_node_config_overrides,
                         startup_settings.initial_peers_override.as_ref(),
                         &startup_settings.ibd_peers,
-                    );
+                        &startup_settings.user_config_overrides,
+                        &startup_settings.deployment_config_overrides,
+                    )?;
                     Ok(config)
                 }),
         ),
@@ -693,23 +715,27 @@ pub async fn start_node(
             chain_info: HashMap::default(),
             wallet_info,
             runtime_dir: node_runtime_dir,
+            immediate_start,
         },
     );
 
-    // Bootstrap peers must be `Mode::OnLine` for IBD of other peers to succeed.
-    ensure_node_ready(
-        cluster,
-        &client,
-        node_name,
-        &started_node_name,
-        is_bootstrap_node,
-        world.require_all_peers_mode_online_at_startup,
-        startup_settings.join_external_network,
-    )
-    .await
-    .inspect_err(|e| {
-        warn!(target: TARGET, "Step `{step}` error: {e}");
-    })?;
+    // All nodes are required to be network ready responsive, and bootstrap nodes
+    // must be `Mode::OnLine` for IBD of other peers to succeed
+    if !immediate_start {
+        ensure_node_ready(
+            cluster,
+            &client,
+            node_name,
+            &started_node_name,
+            is_bootstrap_node,
+            world.require_all_peers_mode_online_at_startup,
+            startup_settings.join_external_network,
+        )
+        .await
+        .inspect_err(|e| {
+            warn!(target: TARGET, "Step `{step}` error: {e}");
+        })?;
+    }
 
     if world.blockchain_snapshot_on_startup.is_some() {
         match client.consensus_info().await {
@@ -717,10 +743,10 @@ pub async fn start_node(
                 info!(
                     target: TARGET,
                     "Node `{node_name}` snapshot state - height: {}/{}, tip: {}, lib: {}",
-                    info.height,
-                    info.slot.into_inner(),
-                    truncate_hash(&info.tip.encode_hex::<String>(), 16),
-                    truncate_hash(&info.lib.encode_hex::<String>(), 16)
+                    info.cryptarchia_info.height,
+                    info.cryptarchia_info.slot.into_inner(),
+                    truncate_hash(&info.cryptarchia_info.tip.encode_hex::<String>(), 16),
+                    truncate_hash(&info.cryptarchia_info.lib.encode_hex::<String>(), 16)
                 );
             }
             Err(e) => {
@@ -742,9 +768,11 @@ pub async fn restart_node(world: &CucumberWorld, step: &str, node_name: &str) ->
         .ok_or(StepError::LogicalError {
             message: "No local cluster available".into(),
         })?;
-    let started_node_name = world.resolve_node_name(node_name).inspect_err(|e| {
-        warn!(target: TARGET, "Step `{step}` error: {e}");
-    })?;
+    let started_node_name = world
+        .resolve_node_runtime_name(node_name)
+        .inspect_err(|e| {
+            warn!(target: TARGET, "Step `{step}` error: {e}");
+        })?;
 
     cluster
         .restart_node(&started_node_name)
@@ -815,7 +843,10 @@ struct StartupSettings {
     is_bootstrap_node: bool,
     initial_peers_override: Option<Vec<Multiaddr>>,
     join_external_network: bool,
-    deployment_override: DeploymentSettings,
+    user_config_overrides: Vec<ConfigOverride>,
+    deployment_config_overrides: Vec<ConfigOverride>,
+    deployment_settings_override: Option<DeploymentSettings>,
+    manual_node_config_overrides: ManualNodeConfigOverrides,
 }
 
 fn get_startup_settings(
@@ -827,7 +858,7 @@ fn get_startup_settings(
     } else {
         let named = initial_peers
             .iter()
-            .map(|peer| world.resolve_node_name(peer))
+            .map(|peer| world.resolve_node_runtime_name(peer))
             .collect::<Result<Vec<String>, StepError>>()?;
         PeerSelection::Named(named)
     };
@@ -845,11 +876,13 @@ fn get_startup_settings(
     let is_bootstrap_node = initial_peers.is_empty();
     let initial_peers_override = world.initial_peers_override.clone();
     let join_external_network = world.join_external_network.unwrap_or_default();
-    let deployment_override = if let Some(path) = world.deployment_config_override_path.clone() {
-        load_run_config(&path)?
-    } else {
-        DeploymentSettings::from(WellKnownDeployment::Devnet)
-    };
+    let deployment_settings_override = world
+        .deployment_config_override_path
+        .clone()
+        .map(|path| load_run_config(&path))
+        .transpose()?;
+    let user_config_overrides = world.user_config_overrides.clone();
+    let deployment_config_overrides = world.deployment_config_overrides.clone();
 
     Ok(StartupSettings {
         peer_selection,
@@ -857,20 +890,34 @@ fn get_startup_settings(
         is_bootstrap_node,
         initial_peers_override,
         join_external_network,
-        deployment_override,
+        deployment_settings_override,
+        manual_node_config_overrides: world.manual_node_config_overrides.clone(),
+        user_config_overrides,
+        deployment_config_overrides,
     })
 }
 
+#[expect(clippy::too_many_arguments, reason = "all needed")]
 fn prepare_config_patch(
     config: &mut RunConfig,
     join_external_network: bool,
-    deployment_override: &DeploymentSettings,
+    deployment_override: Option<&DeploymentSettings>,
+    config_overrides: &ManualNodeConfigOverrides,
     initial_peers_override: Option<&Vec<Multiaddr>>,
     ibd_peers: &HashSet<PeerId>,
-) {
+    user_config_overrides: &[ConfigOverride],
+    deployment_config_overrides: &[ConfigOverride],
+) -> Result<(), StepError> {
     if join_external_network {
+        config.deployment = deployment_override
+            .cloned()
+            .unwrap_or_else(|| DeploymentSettings::from(WellKnownDeployment::Devnet));
+    } else if let Some(deployment_override) = deployment_override {
         config.deployment = deployment_override.clone();
     }
+
+    config_overrides.apply_to(config);
+
     if let Some(initial_peers) = &initial_peers_override {
         config
             .user
@@ -887,6 +934,10 @@ fn prepare_config_patch(
         .ibd
         .peers
         .clone_from(ibd_peers);
+
+    apply_user_config_overrides(config, user_config_overrides)?;
+    apply_deployment_config_overrides(config, deployment_config_overrides)?;
+    Ok(())
 }
 
 fn load_run_config(path: &Path) -> Result<DeploymentSettings, StepError> {
@@ -947,14 +998,14 @@ async fn verify_online(
     started_node_name: &str,
     time_out: Option<Duration>,
 ) -> StepResult {
-    let time_out = time_out.unwrap_or_else(|| Duration::from_secs(60));
+    let time_out = time_out.unwrap_or_else(|| Duration::from_mins(1));
     let start = Instant::now();
     let mut count = 0usize;
     loop {
         let mut mode_online = false;
         match client.consensus_info().await {
             Ok(val) => {
-                if val.mode.is_online() {
+                if matches!(val.mode, ChainServiceMode::Started(State::Online)) {
                     mode_online = true;
                 }
             }
@@ -992,17 +1043,47 @@ async fn verify_online(
     }
 }
 
-#[expect(
-    clippy::cognitive_complexity,
-    reason = "Singular fn with multiple branches to handle different events and futures."
-)]
+/// Wait for all nodes to become responsive
+pub async fn wait_all_nodes_responive(
+    cluster: &LbcManualCluster,
+    time_out: Duration,
+) -> StepResult {
+    timeout(time_out, cluster.wait_network_ready())
+        .await
+        .map_err(|_| StepError::StepFail {
+            message: format!("Not all nodes became responsive after {time_out:?}"),
+        })?
+        .map_err(|e| StepError::StepFail {
+            message: format!("Failed to check all nodes ready: {e}"),
+        })
+}
+
 async fn verify_reponsive_and_network_ready(
     client: &NodeHttpClient,
     node_name: &str,
     started_node_name: &str,
 ) -> StepResult {
+    verify_reponsive_and_network_ready_with_timeout(
+        client,
+        node_name,
+        started_node_name,
+        Duration::from_mins(1),
+    )
+    .await
+}
+
+/// Wait for the node to be responsive and network ready, with a timeout.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "Singular fn with multiple branches to handle different events and futures."
+)]
+pub async fn verify_reponsive_and_network_ready_with_timeout(
+    client: &NodeHttpClient,
+    node_name: &str,
+    started_node_name: &str,
+    time_out: Duration,
+) -> StepResult {
     let start = Instant::now();
-    let time_out = Duration::from_secs(60);
     let mut count = 0usize;
     let mut can_provide_consensus_info;
     let mut is_network_ready;
@@ -1332,30 +1413,141 @@ pub async fn nodes_converged(
     }
 }
 
+pub async fn ensure_all_nodes_agree_on_lib(
+    world: &CucumberWorld,
+    step: &str,
+    time_out_seconds: u64,
+) -> StepResult {
+    let start = Instant::now();
+    let time_out = Duration::from_secs(time_out_seconds);
+    let mut count = 0usize;
+
+    loop {
+        let snapshots = try_join_all(world.nodes_info.values().map(async |node| {
+            let consensus = node.started_node.client.consensus_info().await?;
+            Ok::<_, StepError>((
+                node.name.clone(),
+                consensus.cryptarchia_info.height,
+                consensus.cryptarchia_info.lib.encode_hex::<String>(),
+            ))
+        }))
+        .await?;
+
+        let libs = snapshots
+            .iter()
+            .map(|(_, _, lib)| lib.clone())
+            .collect::<HashSet<_>>();
+
+        if libs.len() == 1 {
+            info!(
+                target: TARGET,
+                "All nodes agree on LIB in {:.2?}",
+                start.elapsed()
+            );
+            return Ok(());
+        }
+
+        if count.is_multiple_of(50) {
+            let status = format_lib_agreement_status(&snapshots);
+
+            info!(
+                target: TARGET,
+                "Waiting for all nodes to agree on LIB - elapsed {:.2?}, {status}",
+                start.elapsed()
+            );
+        }
+
+        if start.elapsed() >= time_out {
+            let status = format_lib_agreement_status(&snapshots);
+
+            return Err(StepError::StepFail {
+                message: format!(
+                    "Step `{step}` error: Nodes did not agree on LIB in {time_out_seconds} s ({status})"
+                ),
+            });
+        }
+
+        sleep(Duration::from_millis(100)).await;
+        count += 1;
+    }
+}
+
+fn format_lib_agreement_status(snapshots: &[(String, u64, String)]) -> String {
+    snapshots
+        .iter()
+        .map(|(node_name, height, lib)| format!("{node_name}: {height}/{}", truncate_hash(lib, 16)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub async fn poll_all_nodes_and_update_consensus_cache<S: ::std::hash::BuildHasher>(
     step: &str,
     nodes_info: &mut HashMap<String, NodeInfo, S>,
 ) -> Result<(), StepError> {
+    use futures_util::future::join_all;
+
     let nodes = nodes_info.values().collect::<Vec<&NodeInfo>>();
+
+    // Query every node, but do not fail-fast on the first error.
     let info_futures = nodes.iter().map(async |node| {
         let node_name = node.name.clone();
-        node.started_node
-            .client
-            .consensus_info()
-            .await
-            .map(|info| ConsensusSnapshot {
-                node_name,
-                height: info.height,
-                header_hash: info.tip.encode_hex(),
-            })
+        let result = node.started_node.client.consensus_info().await;
+        (node_name, result)
     });
 
-    let snapshots: Vec<ConsensusSnapshot> = try_join_all(info_futures).await.inspect_err(|e| {
-        warn!(
-            target: TARGET,
-            "Step `{step}` error: Some node(s) did not respond with their consensus_info: {e}",
-        );
-    })?;
+    let results = join_all(info_futures).await;
+
+    let mut snapshots = Vec::<ConsensusSnapshot>::new();
+    let mut failed_nodes = Vec::<String>::new();
+
+    for (node_name, result) in results {
+        match result {
+            Ok(info) => snapshots.push(ConsensusSnapshot {
+                node_name,
+                height: info.cryptarchia_info.height,
+                header_hash: info.cryptarchia_info.tip.encode_hex(),
+            }),
+            Err(e) => {
+                // If both `consensus_info` and `network_info` fail, assume the node is no
+                // longer responsive.
+                if let Err(e2) = poll_network_info(
+                    nodes_info.get_mut(&node_name).expect("Failed to get node"),
+                    &node_name,
+                    5,
+                )
+                .await
+                {
+                    return Err(StepError::StepFail {
+                        message: format!(
+                            "Step `{step}` error: {node_name} is not responsive anymore: {e} / {e2}"
+                        ),
+                    });
+                }
+                warn!(
+                    target: TARGET,
+                    "Step `{step}` error: node `{node_name}` did not respond with consensus_info: {e}",
+                );
+                failed_nodes.push(node_name);
+            }
+        }
+    }
+
+    // If all nodes failed in this poll, surface a hard error.
+    // If at least one succeeded, update cache for those and let caller keep
+    // polling.
+    if snapshots.is_empty() {
+        let failed = if failed_nodes.is_empty() {
+            "none".to_owned()
+        } else {
+            failed_nodes.join(", ")
+        };
+        return Err(StepError::StepFail {
+            message: format!(
+                "Step `{step}` error: all nodes failed to respond with consensus_info in this poll \
+                (failed: [{failed}])"
+            ),
+        });
+    }
 
     for snap in &snapshots {
         let node = nodes_info
@@ -1369,7 +1561,35 @@ pub async fn poll_all_nodes_and_update_consensus_cache<S: ::std::hash::BuildHash
         node.upsert_tip(snap.height, snap.header_hash.clone());
     }
 
+    if !failed_nodes.is_empty() {
+        warn!(
+            target: TARGET,
+            "Step `{step}` warning: partial consensus poll failure; updated {}/{} node(s), failed: [{}]",
+            snapshots.len(),
+            snapshots.len() + failed_nodes.len(),
+            failed_nodes.join(", "),
+        );
+    }
+
     Ok(())
+}
+
+async fn poll_network_info(
+    node_info: &NodeInfo,
+    node_name: &str,
+    time_out_seconds: u64,
+) -> Result<(), String> {
+    let start = TokioInstant::now();
+    let time_out = Duration::from_secs(time_out_seconds);
+    while start.elapsed() <= time_out {
+        if node_info.started_node.client.network_info().await.is_ok() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    Err(format!(
+        "Node `{node_name}` did not respond to network_info after {time_out_seconds:.2?}"
+    ))
 }
 
 /// This struct represents the wallet resources to be associated with a node at
@@ -1430,7 +1650,7 @@ pub(crate) async fn get_cryptarchia_info_all_nodes(world: &CucumberWorld, step: 
         };
         match node_info.started_node.client.consensus_info().await {
             Ok(consensus) => {
-                let mode = if consensus.mode.is_online() {
+                let mode = if matches!(consensus.mode, ChainServiceMode::Started(State::Online)) {
                     "Online"
                 } else {
                     "Bootstrapping"
@@ -1440,10 +1660,10 @@ pub(crate) async fn get_cryptarchia_info_all_nodes(world: &CucumberWorld, step: 
                     "cryptarchia/info - '{}', '{}', {}/{}, tip '{} ...', lib '{} ...'",
                     node_name,
                     mode,
-                    consensus.height,
-                    consensus.slot.into_inner(),
-                    truncate_hash(&consensus.tip.encode_hex::<String>(), 16),
-                    truncate_hash(&consensus.lib.encode_hex::<String>(), 16),
+                    consensus.cryptarchia_info.height,
+                    consensus.cryptarchia_info.slot.into_inner(),
+                    truncate_hash(&consensus.cryptarchia_info.tip.encode_hex::<String>(), 16),
+                    truncate_hash(&consensus.cryptarchia_info.lib.encode_hex::<String>(), 16),
                 );
             }
             Err(e) => {

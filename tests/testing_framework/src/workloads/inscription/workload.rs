@@ -11,7 +11,10 @@ use lb_core::mantle::{
     MantleTx, SignedMantleTx, Transaction as _,
     ops::{
         Op, OpProof,
-        channel::{ChannelId, MsgId, inscribe::InscriptionOp},
+        channel::{
+            ChannelId, MsgId,
+            inscribe::{Inscription, InscriptionOp},
+        },
     },
     tx::TxHash,
 };
@@ -163,7 +166,7 @@ impl<'a, E: LbcScenarioEnv + LbcBlockFeedEnv> InscriptionRunner<'a, E> {
         Ok(Self {
             channels,
             pending_by_hash: HashMap::new(),
-            feed: E::block_feed_subscription(ctx),
+            feed: E::block_feed_subscription(ctx)?,
             ctx,
             payload_bytes: workload.payload_bytes.get(),
             min_confirmed: workload.min_confirmed,
@@ -283,8 +286,8 @@ impl<'a, E: LbcScenarioEnv + LbcBlockFeedEnv> InscriptionRunner<'a, E> {
     }
 
     fn process_block(&mut self, block: &BlockRecord) {
-        for observed in &block.new_blocks {
-            for tx in observed.block.transactions() {
+        for observed in &block.events {
+            for tx in &observed.block.transactions {
                 let tx_hash = tx.hash();
                 let Some(channel_idx) = self.pending_by_hash.remove(&tx_hash) else {
                     continue;
@@ -388,11 +391,7 @@ fn build_inscription_transaction(
     };
     let msg_id = op.id();
 
-    let mantle_tx = MantleTx {
-        ops: vec![Op::ChannelInscribe(op)],
-        storage_gas_price: 0.into(),
-        execution_gas_price: 0.into(),
-    };
+    let mantle_tx = MantleTx([Op::ChannelInscribe(op)].into());
     let tx_hash = mantle_tx.hash();
 
     let ed25519_signature = channel
@@ -407,7 +406,7 @@ fn build_inscription_transaction(
     Ok((signed_tx, msg_id, tx_hash))
 }
 
-fn build_payload(channel: &ChannelState, payload_bytes: usize) -> Vec<u8> {
+fn build_payload(channel: &ChannelState, payload_bytes: usize) -> Inscription {
     let mut payload = format!(
         "tf-inscription:{:?}:{}",
         channel.channel_id, channel.next_nonce
@@ -420,7 +419,7 @@ fn build_payload(channel: &ChannelState, payload_bytes: usize) -> Vec<u8> {
         payload.truncate(payload_bytes);
     }
 
-    payload
+    Inscription::new_unchecked(payload)
 }
 
 async fn submit_transaction_via_cluster(

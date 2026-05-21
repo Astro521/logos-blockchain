@@ -28,6 +28,7 @@ use lb_key_management_system_service::{
     api::KmsServiceApi, keys::KeyOperators,
     operators::ed25519::exfiltrate_secret_key::LeakSecretKeyOperator,
 };
+use lb_log_targets::blend;
 use lb_services_utils::wait_until_services_are_ready;
 use lb_time_service::{SlotTick, TimeService, TimeServiceMessage};
 use overwatch::{
@@ -54,12 +55,12 @@ use crate::{
         ChainApi, EpochEvent, EpochHandler, PolEpochInfo, PolInfoProvider as PolInfoProviderTrait,
     },
     kms::PreloadKmsService,
-    membership::{self, MembershipInfo},
-    message::{NetworkMessage, ServiceMessage},
+    membership::{self, MembershipInfo, node_id},
+    message::{NetworkInfo, NetworkMessage, ServiceMessage},
     settings::FIRST_STREAM_ITEM_READY_TIMEOUT,
 };
 
-const LOG_TARGET: &str = "blend::service::edge";
+const LOG_TARGET: &str = blend::service::EDGE;
 
 type RunningSettings<Backend, NodeId, RuntimeServiceId> =
     RunningBlendConfig<<Backend as BlendBackend<NodeId, RuntimeServiceId>>::Settings>;
@@ -122,7 +123,7 @@ where
     type Settings = StartingBlendConfig<Backend::Settings>;
     type State = NoState<Self::Settings>;
     type StateOperator = NoOperator<Self::State>;
-    type Message = ServiceMessage<BroadcastSettings>;
+    type Message = ServiceMessage<BroadcastSettings, NodeId>;
 }
 
 #[expect(clippy::too_many_lines, reason = "TODO: Address this at some point.")]
@@ -151,7 +152,7 @@ impl<
     >
 where
     Backend: BlendBackend<NodeId, RuntimeServiceId> + Send + Sync,
-    NodeId: Clone + Debug + Eq + Hash + Send + Sync + 'static,
+    NodeId: Clone + Debug + Eq + Hash + Send + Sync + node_id::TryFrom + 'static,
     BroadcastSettings: Serialize + DeserializeOwned + Send,
     MembershipAdapter: membership::Adapter<NodeId = NodeId, Error: Send + Sync + 'static> + Send,
     membership::ServiceMessage<MembershipAdapter>: Send + Sync + 'static,
@@ -199,7 +200,7 @@ where
 
         wait_until_services_are_ready!(
             &overwatch_handle,
-            Some(Duration::from_secs(60)),
+            Some(Duration::from_mins(1)),
             TimeService<_, _>,
             <MembershipAdapter as membership::Adapter>::Service,
             PreloadKmsService<_>
@@ -224,6 +225,9 @@ where
                 .await
                 .expect("Failed to retrieve non-ephemeral signing key from KMS.")
         };
+        let local_node_id =
+            NodeId::try_from_provider_id(&non_ephemeral_signing_key.public_key().to_bytes())
+                .expect("non-ephemeral signing key should decode into a valid node id");
 
         // Initialize membership stream for session and core-related public PoQ inputs.
         let session_stream = MembershipAdapter::new(
@@ -256,11 +260,22 @@ where
         }
         .await;
 
-        let messages_to_blend_stream = inbound_relay.map(|ServiceMessage::Blend(message)| {
-            NetworkMessage::<BroadcastSettings>::to_bytes(&message)
-                .expect("NetworkMessage should be able to be serialized")
-                .to_vec()
-        });
+        let messages_to_blend_stream = Box::pin(inbound_relay.filter_map(async |msg| {
+            match msg {
+                ServiceMessage::Blend(message) => Some(
+                    NetworkMessage::<BroadcastSettings>::to_bytes(&message)
+                        .expect("NetworkMessage should be able to be serialized")
+                        .to_vec(),
+                ),
+                ServiceMessage::GetNetworkInfo { reply } => {
+                    drop(reply.send(Some(NetworkInfo {
+                        node_id: local_node_id.clone(),
+                        core_info: None,
+                    })));
+                    None
+                }
+            }
+        }));
 
         let epoch_handler = async {
             let chain_service = CryptarchiaServiceApi::<ChainService, _>::new(
@@ -330,6 +345,10 @@ where
 /// # Panics
 /// - If the initial membership is not yielded immediately from the session
 ///   stream.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "TODO: address this in a dedicated refactor"
+)]
 async fn run<Backend, NodeId, ProofsGenerator, ChainService, PolInfoProvider, RuntimeServiceId>(
     session_stream: UninitializedSessionEventStream<
         impl Stream<Item = MembershipInfo<NodeId>> + Unpin,
@@ -449,6 +468,20 @@ where
     let Some(zk_info) = &new_membership_info.zk else {
         return Err(Error::NetworkIsTooSmall(0));
     };
+
+    // Validate the edge node condition up front so the service shuts down on
+    // an invalid membership regardless of whether secret PoL info has arrived
+    // yet. Without this check, an invalid membership would silently update
+    // `current_membership_info` and surface later as a panic in
+    // `handle_new_secret_epoch_info`.
+    let membership_size = new_membership_info.membership.size();
+    if membership_size < settings.minimum_network_size.get() as usize {
+        return Err(Error::NetworkIsTooSmall(membership_size));
+    }
+    if new_membership_info.membership.contains_local() {
+        return Err(Error::LocalIsCoreNode);
+    }
+
     debug!(target: LOG_TARGET, "New session received, trying to create a new message handler");
 
     // Update session and core public inputs, preserving the current epoch's
@@ -482,7 +515,7 @@ where
         settings,
         new_membership_info.membership.clone(),
         new_public_inputs,
-        &current_epoch_private_info.poq_private_inputs,
+        current_epoch_private_info.poq_private_inputs.clone(),
         overwatch_handle,
         current_epoch_private_info.epoch,
     )?;
@@ -582,10 +615,10 @@ fn handle_new_secret_epoch_info<Backend, NodeId, ProofsGenerator, RuntimeService
         settings,
         current_membership,
         new_public_inputs,
-        &new_pol_epoch_info.poq_private_inputs,
+        new_pol_epoch_info.poq_private_inputs.clone(),
         overwatch_handle.clone(),
         new_pol_epoch_info.epoch,
     ).expect("Should not fail to re-create message handler on epoch rotation after private inputs are set.");
 
-    *current_epoch_info_and_message_handler = Some((*new_pol_epoch_info, new_handler));
+    *current_epoch_info_and_message_handler = Some((new_pol_epoch_info.clone(), new_handler));
 }

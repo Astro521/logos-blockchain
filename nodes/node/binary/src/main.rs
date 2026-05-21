@@ -2,9 +2,9 @@ use clap::Parser as _;
 use color_eyre::eyre::{Result, eyre};
 use logos_blockchain_node::{
     UserConfig,
+    cli::{CliArgs, Command, build_run_config},
     config::{
-        CliArgs, DeploymentType, OnUnknownKeys, deployment::DeploymentSettings,
-        deserialize_config_at_path,
+        DeploymentType, OnUnknownKeys, deployment::DeploymentSettings, deserialize_config_at_path,
     },
     get_services_to_start, run_node_from_config,
 };
@@ -12,19 +12,24 @@ use logos_blockchain_node::{
 #[tokio::main]
 async fn main() -> Result<()> {
     #[cfg(feature = "dhat-heap")]
-    let _dhat_drop_guard = logos_blockchain_node::profiling::setup();
+    let _dhat_drop_guard = logos_blockchain_node::global_allocators::dhat_heap::setup();
 
     let cli_args = CliArgs::parse();
 
     if let Some(command) = cli_args.command {
         match command {
-            #[cfg(feature = "config-gen")]
-            logos_blockchain_node::config::Command::Init(init_args) => {
-                return logos_blockchain_node::init::run(&init_args);
+            Command::Init(init_args) => {
+                return logos_blockchain_node::cli::init::run(&init_args);
             }
-            logos_blockchain_node::config::Command::Inscribe(inscribe_args) => {
-                logos_blockchain_tui_zone::run(inscribe_args).await;
+            Command::Inscribe(inscribe_args) => {
+                lb_tui_zone::run(inscribe_args).await;
                 return Ok(());
+            }
+            Command::Participate(participate_args) => {
+                return logos_blockchain_node::cli::participate::run(&participate_args);
+            }
+            Command::GetPeerId(get_peer_id_args) => {
+                return logos_blockchain_node::cli::get_peer_id::run(&get_peer_id_args);
             }
         }
     }
@@ -63,10 +68,10 @@ async fn main() -> Result<()> {
                 .inspect_err(|e| {
                 eprintln!("\nExiting... {e}.\n");
             })?;
-        user_config.update_from_args(cli_args)?
+        build_run_config(user_config, cli_args)?
     };
 
-    let app = run_node_from_config(run_config)
+    let app = run_node_from_config(run_config, None)
         .map_err(|e| eyre!("{e}"))
         .inspect_err(|e| {
             eprintln!("\nExiting... {e}.\n");

@@ -12,13 +12,19 @@ use std::{
 };
 
 use async_trait::async_trait;
-pub use block_feed::{BlockFeed, BlockFeedSnapshot, BlockRecord, NodeHeadSnapshot};
+pub use block_feed::{
+    BlockFeed, BlockFeedExtensionFactory, BlockFeedObservation, BlockFeedObserver,
+    BlockFeedSnapshot, BlockFeedWaitError, BlockRecord, NodeHeadSnapshot, ObservedBlock,
+    block_feed_source_provider, block_feed_sources, named_block_feed_sources,
+};
 use common_http_client::BasicAuthCredentials;
+use lb_config::kms::key_id_for_preload_backend;
+use lb_core::block::genesis::GenesisBlock;
 use lb_node::config::RunConfig;
 use reqwest::Url;
 use testing_framework_core::{
     scenario::{
-        Application, DynError, ExternalNodeSource, FeedRuntime, NodeAccess, NodeClients,
+        Application, DynError, ExternalNodeSource, NodeAccess,
         ScenarioBuilder as CoreScenarioBuilder,
     },
     topology::{DeploymentProvider, DeploymentSeed, DynTopologyError},
@@ -26,12 +32,12 @@ use testing_framework_core::{
 use testing_framework_runner_local::{ManualCluster, ProcessDeployer};
 
 use crate::{
-    framework::block_feed::{BlockFeedRuntime, prepare_block_feed},
+    FailureDiagnosticsExpectation,
     node::{
         DeploymentPlan, NodeHttpClient,
         configs::{
             deployment::{DeploymentBuilder, TopologyConfig},
-            key_id_for_preload_backend, postprocess,
+            postprocess,
             wallet::WalletConfig,
         },
     },
@@ -60,8 +66,6 @@ impl Application for LbcEnv {
 
     type NodeConfig = RunConfig;
 
-    type FeedRuntime = BlockFeedRuntime;
-
     fn external_node_client(source: &ExternalNodeSource) -> Result<Self::NodeClient, DynError> {
         let endpoint = Url::parse(source.endpoint())?;
         let basic_auth = external_basic_auth(&endpoint);
@@ -84,12 +88,6 @@ impl Application for LbcEnv {
     fn node_readiness_path() -> &'static str {
         lb_http_api_common::paths::CRYPTARCHIA_INFO
     }
-
-    async fn prepare_feed(
-        node_clients: NodeClients<Self>,
-    ) -> Result<(<Self::FeedRuntime as FeedRuntime>::Feed, Self::FeedRuntime), DynError> {
-        prepare_block_feed(node_clients).await
-    }
 }
 
 fn external_basic_auth(endpoint: &Url) -> Option<BasicAuthCredentials> {
@@ -111,13 +109,24 @@ pub trait CoreBuilderExt: Sized {
     fn deployment_with(f: impl FnOnce(DeploymentBuilder) -> DeploymentBuilder) -> Self;
 
     #[must_use]
+    fn with_block_feed(self) -> Self;
+
+    #[must_use]
     fn with_wallet_config(self, wallet: WalletConfig) -> Self;
 }
 
 impl CoreBuilderExt for ScenarioBuilder {
     fn deployment_with(f: impl FnOnce(DeploymentBuilder) -> DeploymentBuilder) -> Self {
         let topology = f(DeploymentBuilder::new(TopologyConfig::empty()));
-        Self::new(Box::new(topology))
+
+        Self::new(Box::new(topology)).with_block_feed()
+    }
+
+    fn with_block_feed(self) -> Self {
+        testing_framework_core::scenario::CoreBuilderExt::with_runtime_extension_factory(
+            self,
+            Box::new(BlockFeedExtensionFactory),
+        )
     }
 
     fn with_wallet_config(self, wallet: WalletConfig) -> Self {
@@ -159,17 +168,19 @@ pub fn apply_wallet_config_to_deployment(deployment: &mut DeploymentPlan, wallet
         .map(|plan| plan.general.clone())
         .collect::<Vec<_>>();
 
-    let Some(base_genesis_tx) = deployment.config.genesis_tx.clone() else {
+    let Some(genesis_block): Option<GenesisBlock> = deployment.config.genesis_block.clone() else {
         return;
     };
 
-    let genesis_tx = postprocess::apply_wallet_genesis_overrides(
+    let genesis_block = postprocess::apply_wallet_genesis_overrides(
         &mut node_configs,
-        &base_genesis_tx,
+        &genesis_block,
+        deployment.config.blend_core_nodes,
         &wallet_accounts,
         key_id_for_preload_backend,
+        deployment.config.test_context.as_deref(),
     );
-    deployment.config.genesis_tx = Some(genesis_tx);
+    deployment.config.genesis_block = Some(genesis_block);
 
     for (plan, node_config) in deployment.plans.iter_mut().zip(node_configs) {
         plan.general = node_config;
@@ -242,11 +253,15 @@ impl ScenarioBuilderExt for ScenarioBuilderWith {
     }
 
     fn expect_consensus_liveness(self) -> Self {
-        self.with_expectation(ConsensusLiveness::default())
+        self.with_expectation(FailureDiagnosticsExpectation::new(
+            ConsensusLiveness::default(),
+        ))
     }
 
     fn expect_cluster_fork_monitor(self) -> Self {
-        self.with_expectation(ClusterForkMonitor::<LbcEnv>::default())
+        self.with_expectation(FailureDiagnosticsExpectation::new(ClusterForkMonitor::<
+            LbcEnv,
+        >::default()))
     }
 
     fn initialize_wallet(self, total_funds: u64, users: usize) -> Self {

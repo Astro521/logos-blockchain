@@ -29,13 +29,21 @@ impl From<Value> for Gas {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GasPrice(Value);
 
 impl GasPrice {
     #[must_use]
     pub const fn into_inner(self) -> Value {
         self.0
+    }
+}
+
+impl Add for GasPrice {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self(self.0 + rhs.0)
     }
 }
 
@@ -49,6 +57,7 @@ impl From<Value> for GasPrice {
 pub struct GasCost(Value);
 
 impl GasCost {
+    #[must_use]
     pub const fn new(value: Value) -> Self {
         Self(value)
     }
@@ -140,7 +149,7 @@ pub trait GasConstants {
     const CHANNEL_INSCRIBE: Gas;
 
     /// Verify the administrator signature.
-    const CHANNEL_SET_KEYS: Gas;
+    const CHANNEL_CONFIG: Gas;
 
     /// Verify the deposit signature.
     const CHANNEL_DEPOSIT: Gas;

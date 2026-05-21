@@ -6,13 +6,14 @@ use std::collections::HashSet;
 
 pub use activity::ActivityProof;
 use lb_core::sdp::SessionNumber;
+use lb_log_targets::blend;
 use serde::{Deserialize, Serialize};
 pub use session::SessionInfo;
 pub use token::{BlendingToken, HammingDistance};
 
 pub use crate::reward::session::{BlendingTokenEvaluation, Error, SessionRandomness};
 
-const LOG_TARGET: &str = "blend::message::reward";
+const LOG_TARGET: &str = blend::message::REWARD;
 
 /// Holds blending tokens collected during a single session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,17 +82,49 @@ impl OldSessionBlendingTokenCollector {
     pub fn compute_activity_proof(self) -> Option<ActivityProof> {
         // Find the blending token with the smallest Hamming distance,
         // which is <= activity threshold.
-        self.collector
+        tracing::trace!(
+            LOG_TARGET,
+            "Computing activity proof for session {} with activity threshold {:?} and next session randomness {:?} for {} candidate tokens",
+            self.collector.session_number(),
+            self.collector.token_evaluation.activity_threshold(),
+            self.next_session_randomness,
+            self.collector.tokens.len()
+        );
+        let (winning_activity_proof, distance) = self
+            .collector
             .tokens
             .into_iter()
             .filter_map(|token| {
-                self.collector
+                let token_signing_key = *token.signing_key();
+
+                let distance = self
+                    .collector
                     .token_evaluation
                     .evaluate(&token, self.next_session_randomness)
-                    .map(|distance| (token, distance))
+                    .map(|distance| (token, distance));
+
+                tracing::trace!(
+                    LOG_TARGET,
+                    "Evaluated token {token_signing_key:?} with distance {distance:?}",
+                );
+
+                distance
             })
             .min_by_key(|(_, distance)| *distance)
-            .map(|(token, _)| ActivityProof::new(self.collector.session_number, token))
+            .map(|(token, distance)| {
+                (
+                    ActivityProof::new(self.collector.session_number, token),
+                    distance,
+                )
+            })?;
+
+        tracing::trace!(
+            LOG_TARGET,
+            "Computed activity proof for session {}: {winning_activity_proof:?} with Hamming distance {distance:?}",
+            self.collector.session_number,
+        );
+
+        Some(winning_activity_proof)
     }
 
     #[must_use]

@@ -3,11 +3,11 @@ use std::{hash::Hash, pin::Pin};
 use futures::Stream;
 use thiserror::Error;
 
+pub mod channel;
 pub mod encoding;
 pub mod gas;
 pub mod genesis_tx;
 pub mod ledger;
-#[cfg(feature = "mock")]
 pub mod mock;
 pub mod ops;
 pub mod select;
@@ -40,12 +40,12 @@ pub trait Transaction {
     fn hash(&self) -> Self::Hash {
         Self::HASHER(self)
     }
-    /// Returns the Fr's that are used to form a signature of a transaction.
+    /// Returns the bytes' that are used to form a signature of a transaction.
     ///
-    /// The resulting Fr's are then used by the `HASHER`
+    /// The resulting bytes' are then used by the `HASHER`
     /// to produce the transaction's unique hash, which is what is typically
     /// signed by the transaction originator.
-    fn as_signing_frs(&self) -> Vec<Fr>;
+    fn as_signing(&self) -> Vec<u8>;
 }
 
 pub trait AuthenticatedMantleTx: Transaction<Hash = TxHash> + GasCalculator + StorageSize {
@@ -55,10 +55,22 @@ pub trait AuthenticatedMantleTx: Transaction<Hash = TxHash> + GasCalculator + St
     fn ops_with_proof(&self) -> impl Iterator<Item = (&Op, &OpProof)>;
 
     // Gas Cost functions with context already handled
-    fn total_gas_cost<Constants: GasConstants>(&self) -> Result<GasCost, GasOverflow>;
-    fn storage_gas_cost(&self) -> Result<GasCost, GasOverflow>;
-    fn execution_gas_consumption<Constants: GasConstants>(&self) -> Result<Gas, GasOverflow>;
-    fn storage_gas_consumption(&self) -> Result<Gas, GasOverflow>;
+    fn total_gas_cost<Constants: GasConstants>(
+        &self,
+        context: <Self as AuthenticatedMantleTx>::Context,
+    ) -> Result<GasCost, GasOverflow>;
+    fn storage_gas_cost(
+        &self,
+        context: <Self as AuthenticatedMantleTx>::Context,
+    ) -> Result<GasCost, GasOverflow>;
+    fn execution_gas_consumption<Constants: GasConstants>(
+        &self,
+        context: <Self as AuthenticatedMantleTx>::Context,
+    ) -> Result<Gas, GasOverflow>;
+    fn storage_gas_consumption(
+        &self,
+        context: <Self as AuthenticatedMantleTx>::Context,
+    ) -> Result<Gas, GasOverflow>;
 
     fn verify_ops_proofs_with_helper(
         &self,
@@ -71,6 +83,7 @@ pub trait AuthenticatedMantleTx: Transaction<Hash = TxHash> + GasCalculator + St
 pub trait GenesisTx: Transaction<Hash = TxHash> {
     fn genesis_transfer(&self) -> &TransferOp;
     fn genesis_inscription(&self) -> &InscriptionOp;
+    fn cryptarchia_parameter(&self) -> CryptarchiaParameter;
     fn sdp_declarations(&self) -> impl Iterator<Item = (&SDPDeclareOp, &OpProof)>;
     fn mantle_tx(&self) -> &MantleTx;
 }
@@ -79,8 +92,8 @@ impl<T: Transaction> Transaction for &T {
     const HASHER: TransactionHasher<Self> = |tx| T::HASHER(tx);
     type Hash = T::Hash;
 
-    fn as_signing_frs(&self) -> Vec<Fr> {
-        T::as_signing_frs(self)
+    fn as_signing(&self) -> Vec<u8> {
+        T::as_signing(self)
     }
 }
 
@@ -91,6 +104,7 @@ impl<T: StorageSize> StorageSize for &T {
 }
 
 impl<T: AuthenticatedMantleTx> AuthenticatedMantleTx for &T {
+    type Context = <T as AuthenticatedMantleTx>::Context;
     fn mantle_tx(&self) -> &MantleTx {
         T::mantle_tx(self)
     }
@@ -99,20 +113,32 @@ impl<T: AuthenticatedMantleTx> AuthenticatedMantleTx for &T {
         T::ops_with_proof(self)
     }
 
-    fn total_gas_cost<Constants: GasConstants>(&self) -> Result<GasCost, GasOverflow> {
-        <T as AuthenticatedMantleTx>::total_gas_cost::<Constants>(self)
+    fn total_gas_cost<Constants: GasConstants>(
+        &self,
+        context: <Self as AuthenticatedMantleTx>::Context,
+    ) -> Result<GasCost, GasOverflow> {
+        <T as AuthenticatedMantleTx>::total_gas_cost::<Constants>(self, context)
     }
 
-    fn storage_gas_cost(&self) -> Result<GasCost, GasOverflow> {
-        <T as AuthenticatedMantleTx>::storage_gas_cost(self)
+    fn storage_gas_cost(
+        &self,
+        context: <Self as AuthenticatedMantleTx>::Context,
+    ) -> Result<GasCost, GasOverflow> {
+        <T as AuthenticatedMantleTx>::storage_gas_cost(self, context)
     }
 
-    fn execution_gas_consumption<Constants: GasConstants>(&self) -> Result<Gas, GasOverflow> {
-        <T as AuthenticatedMantleTx>::execution_gas_consumption::<Constants>(self)
+    fn execution_gas_consumption<Constants: GasConstants>(
+        &self,
+        context: <Self as AuthenticatedMantleTx>::Context,
+    ) -> Result<Gas, GasOverflow> {
+        <T as AuthenticatedMantleTx>::execution_gas_consumption::<Constants>(self, context)
     }
 
-    fn storage_gas_consumption(&self) -> Result<Gas, GasOverflow> {
-        <T as AuthenticatedMantleTx>::storage_gas_consumption(self)
+    fn storage_gas_consumption(
+        &self,
+        context: <Self as AuthenticatedMantleTx>::Context,
+    ) -> Result<Gas, GasOverflow> {
+        <T as AuthenticatedMantleTx>::storage_gas_consumption(self, context)
     }
 
     fn verify_ops_proofs_with_helper(
@@ -132,6 +158,10 @@ impl<T: GenesisTx> GenesisTx for &T {
     }
     fn genesis_inscription(&self) -> &InscriptionOp {
         T::genesis_inscription(self)
+    }
+
+    fn cryptarchia_parameter(&self) -> CryptarchiaParameter {
+        T::cryptarchia_parameter(self)
     }
 
     fn sdp_declarations(&self) -> impl Iterator<Item = (&SDPDeclareOp, &OpProof)> {

@@ -1,19 +1,17 @@
-use lb_common_http_client::CommonHttpClient;
-use lb_core::mantle::{MantleTx, SignedMantleTx};
-use logos_blockchain_tests::topology::{Topology, TopologyConfig};
+use common_http_client::CommonHttpClient;
+use nomos_mantle_core::tx::{MantleTx, SignedMantleTx};
 use reqwest::Url;
-use serial_test::serial;
+use tests::topology::{Topology, TopologyConfig};
 
 #[tokio::test]
-#[serial]
 async fn test_post_mantle_tx() {
-    let topology = Topology::spawn(TopologyConfig::two_validators()).await;
+    let topology = Topology::spawn(TopologyConfig::validator_and_executor()).await;
     let validator = &topology.validators()[0];
 
     let validator_url = Url::parse(
         format!(
             "http://{}",
-            validator.config().user.api.backend.listen_address
+            validator.config().http.backend_settings.address
         )
         .as_str(),
     )
@@ -21,13 +19,14 @@ async fn test_post_mantle_tx() {
 
     let mantle_tx = MantleTx {
         ops: Vec::new(),
-        storage_gas_price: 0,
-        execution_gas_price: 0,
+        ledger_tx: std::marker::PhantomData,
+        gas_price: 0,
     };
 
     let signed_tx = SignedMantleTx {
-        ops_proofs: Vec::new(),
         mantle_tx,
+        ops_profs: Vec::new(),
+        ledger_tx_proof: (),
     };
 
     let client = CommonHttpClient::new(None);

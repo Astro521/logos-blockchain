@@ -1,9 +1,12 @@
+mod deser;
+pub mod genesis;
+
 use core::fmt::Debug;
 
-use ::serde::{Deserialize, Serialize, de::DeserializeOwned};
 use bytes::Bytes;
 use lb_cryptarchia_engine::Slot;
 use lb_key_management_system_keys::keys::{Ed25519Key, Ed25519Signature};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
     codec::{DeserializeOp as _, SerializeOp as _},
@@ -237,19 +240,18 @@ impl<Tx: Clone + Eq + Serialize + DeserializeOwned> TryFrom<Block<Tx>> for Bytes
 mod tests {
     use std::iter;
 
-    use ark_ff::Field as _;
     use lb_groth16::Fr;
     use lb_key_management_system_keys::keys::UnsecuredZkKey;
     use lb_pol::LotteryConstants;
     use lb_utils::math::NonNegativeRatio;
     use lb_utxotree::UtxoTree;
-    use num_bigint::BigUint;
 
     use super::*;
     use crate::{
         crypto::ZkHasher,
         mantle::{
             MantleTx, TransactionHasher,
+            encoding::Ops,
             ledger::{Note, Utxo},
             ops::leader_claim::VoucherCm,
         },
@@ -265,7 +267,7 @@ mod tests {
     pub fn create_proof() -> Groth16LeaderProof {
         let leader_sk = UnsecuredZkKey::zero();
         let utxo = Utxo {
-            transfer_hash: Fr::from(BigUint::from(1u8)).into(),
+            op_id: [0u8; 32],
             output_index: 0,
             note: Note::new(1000, leader_sk.to_public_key()),
         };
@@ -404,11 +406,11 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     pub struct TestMantleTx;
     impl Transaction for TestMantleTx {
-        const HASHER: TransactionHasher<Self> = |_tx| TxHash(Fr::ZERO);
+        const HASHER: TransactionHasher<Self> = |_tx| TxHash::from([0u8; 32]);
         type Hash = TxHash;
 
-        fn as_signing_frs(&self) -> Vec<Fr> {
-            vec![Fr::ZERO]
+        fn as_signing(&self) -> Vec<u8> {
+            vec![0u8]
         }
     }
 

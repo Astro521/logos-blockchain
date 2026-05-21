@@ -19,8 +19,7 @@ use crate::mantle::sdp::rewards::{
 
 /// The immutable state of the target session for which rewards are being
 /// calculated. The target session is `s-1` if `s` is the current session.
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TargetSessionState<ProofsVerifier> {
     /// The target session number
     session_number: SessionNumber,
@@ -115,11 +114,16 @@ where
             })
             .ok_or(Error::InvalidProof)?;
 
+        tracing::trace!(
+            "Verifying activity proof {:?} with session randomness: {:?}",
+            verified_proof.token().signing_key(),
+            current_session_state.session_randomness()
+        );
         let Some(hamming_distance) = self.token_evaluation.evaluate(
             verified_proof.token(),
             current_session_state.session_randomness(),
         ) else {
-            return Err(Error::InvalidProof);
+            return Err(Error::HammingDistanceTooLarge);
         };
 
         Ok((zk_id, hamming_distance))
@@ -128,8 +132,7 @@ where
 
 /// Tracks activity proofs submitted for the target session whose rewards are
 /// being calculated. The target session is `s-1` if `s` is the current session.
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TargetSessionTracker {
     /// Collecting proofs submitted by providers in the target session.
     submitted_proofs: HashTrieMapSync<ProviderId, (ZkPublicKey, HammingDistance)>,
@@ -208,8 +211,7 @@ impl TargetSessionTracker {
     }
 }
 
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MinHammingDistance {
     min_distance: HammingDistance,
     providers: HashTrieSetSync<ProviderId>,

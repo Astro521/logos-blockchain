@@ -1,3 +1,4 @@
+use lb_log_targets::libp2p as lb_log_targets_libp2p;
 use multiaddr::Multiaddr;
 use upnp::UpnpProtocol;
 
@@ -13,6 +14,8 @@ mod nat_pmp;
 mod pcp;
 mod pcp_core;
 mod upnp;
+
+const LOG_TARGET: &str = lb_log_targets_libp2p::behaviour::nat::address_mapper::protocols::ROOT;
 
 #[async_trait::async_trait]
 pub trait NatMapper: Send + Sync + 'static {
@@ -32,18 +35,27 @@ impl NatMapper for ProtocolManager {
         settings: NatMappingSettings,
     ) -> Result<Multiaddr, AddressMapperError> {
         if let Ok(external_address) = PcpProtocol::map_address(address, settings).await {
-            tracing::info!("Successfully mapped {address} to {external_address} using PCP");
+            tracing::info!(
+                target: LOG_TARGET,
+                "Successfully mapped {address} to {external_address} using PCP"
+            );
             return Ok(external_address);
         }
 
         if let Ok(external_address) = NatPmp::map_address(address, settings).await {
-            tracing::info!("Successfully mapped {address} to {external_address} using NAT-PMP");
+            tracing::info!(
+                target: LOG_TARGET,
+                "Successfully mapped {address} to {external_address} using NAT-PMP"
+            );
 
             return Ok(external_address);
         }
 
         let external_address = UpnpProtocol::map_address(address, settings).await?;
-        tracing::info!("Successfully mapped {address} to {external_address} using UPnP");
+        tracing::info!(
+            target: LOG_TARGET,
+            "Successfully mapped {address} to {external_address} using UPnP"
+        );
 
         Ok(external_address)
     }
@@ -64,7 +76,7 @@ mod real_gateway_tests {
         let random_port: u64 = thread_rng().gen_range(10000..=64000);
         let local_address = format!("/ip4/{local_ip}/tcp/{random_port}");
 
-        println!("Testing NAT mapping for local address: {local_address}",);
+        println!("Testing NAT mapping for local address: {local_address}");
 
         let local_address: Multiaddr = local_address.parse().expect("valid multiaddr");
 

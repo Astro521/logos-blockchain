@@ -16,8 +16,10 @@ Feature: Manual control of transactions
   #   SEND, transactions <count>, value <amount>, from '<wallet_name>', to '<wallet_name>'
   #   VERIFY_MAX, wallet '<wallet_name>', wallet_state_type 'on-chain'/'encumbered'/'available', outputs <count>, value 14000, time_out <duration_seconds>
   #   VERIFY_MIN, wallet '<wallet_name>', wallet_state_type 'on-chain'/'encumbered'/'available', outputs <count>, value 14000, time_out <duration_seconds>
-  #   CONTINUOUS_USER_WALLETS, coin_split_outputs <count>, coin_split_value <amount>, transactions <count>, value <amount>, cycles <count>
-  #   CONTINUOUS_FUNDING_WALLETS, coin_split_outputs <count>, coin_split_value <amount>, transactions <count>, value <amount>, cycles <count>
+  #   CONTINUOUS_ROUND_ROBIN_USER_WALLETS, coin_split_outputs <count>, coin_split_value <amount>, transactions <count>, value <amount>, cycles <count>
+  #   COIN_SPLIT_ALL_USER_WALLETS, splits_per_wallet <count>, outputs <count>, value <amount>
+  #   VERIFY_MIN_AVAILABLE_OUTPUTS_ALL_USER_WALLETS, min_outputs <count>, timeout_seconds <duration_seconds>
+  #   CONTINUOUS_NEXT_WALLET_USER_WALLETS, cycles <count>, transactions_per_wallet <count>, value <amount>
   #   FAUCET_ALL_USER_WALLETS, rounds <count>
   #   FAUCET_ALL_FUNDING_WALLETS, rounds <count>
   #   CREATE_BLOCKCHAIN_SNAPSHOT_ALL_NODES, snapshot_name '<snapshot_name>'
@@ -44,7 +46,7 @@ Feature: Manual control of transactions
   #   CREATE_BLOCKCHAIN_SNAPSHOT_NODE, snapshot_name 'SNAP_TEST_01', node_name 'NODE_1'
   #   RESTART_NODE, node_name 'NODE_1'
   #   CREATE_BLOCKCHAIN_SNAPSHOT_ALL_NODES, snapshot_name 'SNAP_TEST_02'
-  #   CONTINUOUS_USER_WALLETS, coin_split_outputs 10, coin_split_value 100, transactions 10, value 100, cycles 3
+  #   CONTINUOUS_ROUND_ROBIN_USER_WALLETS, coin_split_outputs 10, coin_split_value 100, transactions 10, value 100, cycles 3
   #   STOP
 
   @transactions_manual_control
@@ -132,7 +134,7 @@ Feature: Manual control of transactions
   Scenario: Start from snapshot and create new snapshot
     Given I have a devnet cluster with capacity of 2 nodes
     And we join an external network
-    And I will initialize started nodes from snapshot "SNAP_TEST_02" source node "NODE_1"
+    And I will initialize started nodes from snapshot "000_094_856" source node "NODE"
     And I will create a blockchain snapshot "SNAP_TEST_03" of all nodes when stopping
     And I have a faucet with URL "https://devnet.blockchain.logos.co" username "env(CCMBR_DEVNET_USER)" and password "env(CCMBR_DEVNET_PWD)"
     And I have initial peers:
@@ -155,15 +157,20 @@ Feature: Manual control of transactions
       | node_name | account_index | wallet_name | connected_to |
       | NODE_1    | 1             | WALLET_1A   |              |
       | NODE_2    | 2             | WALLET_2A   | NODE_1       |
-    When node "NODE_1" is at height 30200 in 30000 seconds
-    When node "NODE_2" is at height 30200 in 30000 seconds
+    And I have public cryptarchia endpoint peers:
+      | public_cryptarchia_endpoint               | username               | password              |
+      | https://devnet.blockchain.logos.co/node/0 | env(CCMBR_DEVNET_USER) | env(CCMBR_DEVNET_PWD) |
+      | https://devnet.blockchain.logos.co/node/1 | env(CCMBR_DEVNET_USER) | env(CCMBR_DEVNET_PWD) |
+      | https://devnet.blockchain.logos.co/node/2 | env(CCMBR_DEVNET_USER) | env(CCMBR_DEVNET_PWD) |
+      | https://devnet.blockchain.logos.co/node/3 | env(CCMBR_DEVNET_USER) | env(CCMBR_DEVNET_PWD) |
+    When I wait for all nodes to be synced to the chain
     Then I stop all nodes
 
   @transactions_devnet_manual_control
   Scenario: Start from base snapshot
     Given I have a devnet cluster with capacity of 2 nodes
     And we join an external network
-    And I will initialize started nodes from snapshot "000_076_658" source node "NODE"
+    And I will initialize started nodes from snapshot "000_094_856" source node "NODE"
     And I have a faucet with URL "https://devnet.blockchain.logos.co" username "env(CCMBR_DEVNET_USER)" and password "env(CCMBR_DEVNET_PWD)"
     And I have initial peers:
       | initial_peer                                                                                  |
@@ -198,6 +205,7 @@ Feature: Manual control of transactions
   Scenario: Transactions devnet manual control
     Given I have a devnet cluster with capacity of 2 nodes
     And we join an external network
+    And I will initialize started nodes from snapshot "000_094_856" source node "NODE"
     And I have a faucet with URL "https://devnet.blockchain.logos.co" username "env(CCMBR_DEVNET_USER)" and password "env(CCMBR_DEVNET_PWD)"
     And I have initial peers:
       | initial_peer                                                                                  |
@@ -235,6 +243,7 @@ Feature: Manual control of transactions
   Scenario: Transactions stress devnet manual control
     Given I have a devnet cluster with capacity of 10 nodes
     And we join an external network
+    And I will initialize started nodes from snapshot "000_094_856" source node "NODE"
     And I have a faucet with URL "https://devnet.blockchain.logos.co" username "env(CCMBR_DEVNET_USER)" and password "env(CCMBR_DEVNET_PWD)"
     And I have initial peers:
       | initial_peer                                                                                  |

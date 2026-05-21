@@ -9,7 +9,10 @@ use std::{
 
 use async_trait::async_trait;
 use lb_core::mantle::{
-    GenesisTx as _, Note, OpProof, SignedMantleTx, Transaction as _, Utxo, tx::MantleTxGasContext,
+    GasCalculator as _, GenesisTx as _, Note, OpProof, SignedMantleTx, Transaction as _, Utxo,
+    gas::MainnetGasConstants,
+    ops::OpId as _,
+    tx::{GasPrices, MantleTxContext, MantleTxGasContext},
     tx_builder::MantleTxBuilder,
 };
 use lb_key_management_system_service::keys::{ZkKey, ZkPublicKey};
@@ -100,12 +103,17 @@ where
             .nodes()
             .first()
             .ok_or(TxWorkloadError::MissingReferenceNode)?;
-        let genesis_tx = descriptors
+        let genesis_block = descriptors
             .config()
-            .genesis_tx
+            .genesis_block
             .as_ref()
             .ok_or(TxWorkloadError::MissingReferenceNode)?;
-        let utxo_map = wallet_utxo_map(genesis_tx);
+        let utxo_map = wallet_utxo_map(
+            genesis_block
+                .transactions()
+                .next()
+                .expect("Genesis block should contain a genesis tx"),
+        );
 
         let mut accounts = wallet_accounts
             .into_iter()
@@ -184,7 +192,8 @@ impl<'a, E: LbcScenarioEnv> Submission<'a, E> {
     }
 
     async fn execute(mut self) -> Result<(), DynError> {
-        let gas_context = MantleTxGasContext::new(HashMap::new());
+        let gas_context =
+            MantleTxGasContext::new(HashMap::new(), HashMap::new(), GasPrices::new(0, 0));
         while let Some(input) = self.plan.pop_front() {
             submit_wallet_transaction(self.ctx, &input, gas_context.clone()).await?;
             if !self.interval.is_zero() {
@@ -200,7 +209,7 @@ async fn submit_wallet_transaction(
     input: &WalletInput,
     gas_context: MantleTxGasContext,
 ) -> Result<(), DynError> {
-    let signed_tx = Arc::new(build_wallet_transaction(input, gas_context)?);
+    let signed_tx = Arc::new(build_wallet_transaction(input, &gas_context)?);
     submit_transaction_via_cluster(ctx, signed_tx).await
 }
 
@@ -267,16 +276,37 @@ fn cluster_client_exhausted_error() -> DynError {
 
 fn build_wallet_transaction(
     input: &WalletInput,
-    gas_context: MantleTxGasContext,
+    gas_context: &MantleTxGasContext,
 ) -> Result<SignedMantleTx, DynError> {
-    let tx = MantleTxBuilder::new(gas_context)
+    let receiver = input.account.public_key();
+    let tx_context = MantleTxContext {
+        gas_context: gas_context.clone(),
+        leader_reward_amount: 0,
+    };
+
+    let provisional_tx = MantleTxBuilder::new(tx_context.clone())
         .add_ledger_input(input.utxo)
-        .add_ledger_output(Note::new(input.utxo.note.value, input.account.public_key()))
+        .add_ledger_output(Note::new(input.utxo.note.value, receiver))
+        .build();
+
+    let fee = provisional_tx
+        .total_gas_cost::<MainnetGasConstants>(gas_context)?
+        .into_inner();
+    let output_value = input.utxo.note.value.checked_sub(fee).ok_or_else(|| {
+        format!(
+            "input note value {} below fee {}",
+            input.utxo.note.value, fee
+        )
+    })?;
+
+    let tx = MantleTxBuilder::new(tx_context)
+        .add_ledger_input(input.utxo)
+        .add_ledger_output(Note::new(output_value, receiver))
         .build();
 
     let signature = ZkKey::multi_sign(
         slice::from_ref(&input.account.secret_key),
-        tx.hash().as_ref(),
+        &tx.hash().to_fr(),
     )
     .map_err(|err| format!("failed to sign transaction: {err}"))?;
 
@@ -288,13 +318,13 @@ fn wallet_utxo_map(
     genesis_tx: &lb_core::mantle::genesis_tx::GenesisTx,
 ) -> HashMap<ZkPublicKey, Utxo> {
     let transfer_op = genesis_tx.genesis_transfer().clone();
-    let tx_hash = transfer_op.hash();
+    let op_id = transfer_op.op_id();
 
     transfer_op
         .outputs
         .iter()
         .enumerate()
-        .map(|(idx, note)| (note.pk, Utxo::new(tx_hash, idx, *note)))
+        .map(|(idx, note)| (note.pk, Utxo::new(op_id, idx, *note)))
         .collect()
 }
 

@@ -1,10 +1,10 @@
+pub mod bounded_vec;
 pub mod fisheryates;
 pub mod math;
 pub mod net;
 pub mod noop_service;
-
-#[cfg(feature = "types")]
 pub mod types;
+pub mod yaml;
 
 #[cfg(feature = "rng")]
 pub mod blake_rng;
@@ -15,7 +15,6 @@ pub mod bounded_duration;
 #[cfg(feature = "tokio")]
 pub mod tokio;
 
-#[cfg(feature = "serde")]
 pub mod serde {
     fn serialize_human_readable_bytes_array<const N: usize, S: serde::Serializer>(
         src: [u8; N],
@@ -79,6 +78,39 @@ pub mod serde {
             deserialize_human_readable_bytes_array(deserializer)
         } else {
             deserialize_human_unreadable_bytes_array(deserializer)
+        }
+    }
+
+    pub mod serde_bytes_slice {
+        use core::fmt::Display;
+
+        use serde::{Deserialize as _, Deserializer, Serializer, de::Error};
+
+        pub fn serialize<Bytes: AsRef<[u8]>, S: Serializer>(
+            bytes: &Bytes,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            let bytes = bytes.as_ref();
+            if serializer.is_human_readable() {
+                serializer.serialize_str(&const_hex::encode(bytes))
+            } else {
+                serializer.serialize_bytes(bytes)
+            }
+        }
+
+        pub fn deserialize<'de, T: TryFrom<Vec<u8>, Error: Display>, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<T, D::Error> {
+            if deserializer.is_human_readable() {
+                let s = String::deserialize(deserializer)?;
+                let res = const_hex::decode(s)
+                    .map(T::try_from)
+                    .map_err(|_| Error::custom("Failed to convert decoded bytes"))?;
+                res.map_err(Error::custom)
+            } else {
+                let res = Vec::<u8>::deserialize(deserializer).map(T::try_from)?;
+                res.map_err(Error::custom)
+            }
         }
     }
 }

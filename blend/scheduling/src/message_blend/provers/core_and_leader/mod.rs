@@ -6,6 +6,7 @@ use lb_blend_proofs::quota::inputs::prove::{
     private::ProofOfLeadershipQuotaInputs, public::LeaderInputs,
 };
 use lb_cryptarchia_engine::Epoch;
+use lb_log_targets::blend;
 
 use crate::message_blend::{
     CoreProofOfQuotaGenerator,
@@ -19,7 +20,7 @@ use crate::message_blend::{
 #[cfg(test)]
 mod tests;
 
-const LOG_TARGET: &str = "blend::scheduling::proofs::core-and-leader";
+const LOG_TARGET: &str = blend::scheduling::proofs::CORE_AND_LEADER;
 
 /// Proof generator for core and leader `PoQ` variants.
 ///
@@ -94,6 +95,10 @@ where
     // Changes epoch-related info for the core generator, and stops the old leader
     // generator if it's still on the previous epoch. If not, `rotate_epoch` is
     // effectively a no-op.
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "TODO: address this in a dedicated refactor"
+    )]
     fn rotate_epoch(&mut self, new_epoch_public: LeaderInputs, new_epoch: Epoch) {
         match self.core_proofs_generator.current_epoch().cmp(&new_epoch) {
             Ordering::Less => {

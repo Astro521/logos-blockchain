@@ -2,6 +2,7 @@ use anyhow::Result;
 use cfgsync_adapter::MaterializedArtifacts;
 use cfgsync_artifacts::ArtifactFile;
 use lb_core::{
+    block::genesis::GenesisBlock,
     mantle::GenesisTx as _,
     sdp::{Locator, ServiceType},
 };
@@ -15,7 +16,7 @@ use crate::{
         NodePlan,
         configs::{
             default_e2e_deployment_settings,
-            node_configs::consensus::{ProviderInfo, create_genesis_tx_with_declarations},
+            node_configs::consensus::{ProviderInfo, create_genesis_block_with_declarations},
         },
     },
 };
@@ -23,7 +24,7 @@ use crate::{
 #[derive(Debug, Error)]
 pub enum ArtifactError {
     #[error("deployment plan is missing `genesis_tx`")]
-    MissingGenesisTx,
+    MissingGenesisBlock,
     #[error("runtime hostname count ({hostnames}) does not match node count ({nodes})")]
     HostnameCountMismatch { hostnames: usize, nodes: usize },
     #[error("node {node_index} blend address is missing a UDP port")]
@@ -76,22 +77,36 @@ fn deployment_settings(
     topology: &DeploymentPlan,
     hostnames: &[String],
 ) -> Result<DeploymentSettings> {
-    let genesis_tx = topology
+    let genesis_block: GenesisBlock = topology
         .config()
-        .genesis_tx
+        .genesis_block
         .clone()
-        .ok_or(ArtifactError::MissingGenesisTx)?;
+        .ok_or(ArtifactError::MissingGenesisBlock)?;
 
-    let providers = collect_runtime_blend_providers(topology.nodes(), hostnames)?;
-    let transfer_op = genesis_tx.genesis_transfer().clone();
-    let genesis_tx = create_genesis_tx_with_declarations(transfer_op, providers);
+    let providers = collect_runtime_blend_providers(
+        topology.nodes(),
+        hostnames,
+        topology.config().blend_core_nodes,
+    )?;
+    let transfer_op = genesis_block
+        .transactions()
+        .next()
+        .expect("Genesis block should be valid")
+        .genesis_transfer()
+        .clone();
+    let genesis_block = create_genesis_block_with_declarations(
+        transfer_op,
+        providers,
+        topology.config.test_context.as_deref(),
+    );
 
-    Ok(default_e2e_deployment_settings(genesis_tx))
+    Ok(default_e2e_deployment_settings(&genesis_block))
 }
 
 fn collect_runtime_blend_providers(
     nodes: &[NodePlan],
     hostnames: &[String],
+    n_blend_core_nodes: usize,
 ) -> Result<Vec<ProviderInfo>> {
     if nodes.len() != hostnames.len() {
         return Err(ArtifactError::HostnameCountMismatch {
@@ -101,9 +116,14 @@ fn collect_runtime_blend_providers(
         .into());
     }
 
-    let mut providers = Vec::with_capacity(nodes.len());
+    let mut providers = Vec::with_capacity(n_blend_core_nodes);
 
-    for (index, (node, hostname)) in nodes.iter().zip(hostnames.iter()).enumerate() {
+    for (index, (node, hostname)) in nodes
+        .iter()
+        .zip(hostnames.iter())
+        .take(n_blend_core_nodes)
+        .enumerate()
+    {
         let port = blend_udp_port(node, index)?;
         let locator = runtime_blend_locator(hostname, port);
         let (_, provider_sk, zk_sk) = &node.general.blend_config;
@@ -141,5 +161,5 @@ fn runtime_blend_locator(hostname: &str, port: u16) -> Locator {
     multiaddr.push(Protocol::Udp(port));
     multiaddr.push(Protocol::QuicV1);
 
-    Locator::new(multiaddr)
+    Locator::new_unchecked(multiaddr)
 }

@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 pub struct ChannelDepositRequestBody {
     pub tip: Option<HeaderId>,
     pub deposit: DepositOp,
-    pub burn: TransferOp,
     pub change_public_key: ZkPublicKey,
     pub funding_public_keys: Vec<ZkPublicKey>,
     pub max_tx_fee: GasCost,

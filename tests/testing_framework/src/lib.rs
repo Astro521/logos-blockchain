@@ -5,33 +5,34 @@
 //! - `configs::*` for topology and wallet configuration
 //! - `NodeHttpClient` for node API calls
 
-use std::{net::Ipv4Addr, sync::LazyLock};
+use std::sync::LazyLock;
 
-use lb_libp2p::{Multiaddr, multiaddr};
-
+mod diagnostics;
 pub mod env;
 mod framework;
 pub use framework::local::USER_CONFIG_FILE;
 mod node;
+mod unique_persistent;
 pub mod workloads;
-
-pub(crate) mod common {
-    pub mod kms {
-        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/../src/common/kms.rs"));
-    }
-}
+pub use unique_persistent::{
+    get_reserved_available_tcp_port, get_reserved_available_udp_port, hash_str,
+    reap_all_stale_port_blocks, release_reserved_port_block, unique_test_context,
+};
 
 pub static IS_DEBUG_TRACING: LazyLock<bool> = LazyLock::new(env::debug_tracing);
 pub const LOGOS_BLOCKCHAIN_LOG_LEVEL: &str = "LOGOS_BLOCKCHAIN_LOG_LEVEL";
 
-fn node_address_from_port(port: u16) -> Multiaddr {
-    multiaddr(Ipv4Addr::LOCALHOST, port)
-}
-
+pub use diagnostics::{
+    FailureDiagnosticsExpectation, ScenarioRunDiagnosticsError, record_system_monitor_event,
+    register_system_monitor_output_file, run_with_failure_diagnostics,
+    unregister_system_monitor_output_file,
+};
 pub use framework::{
-    BlockFeed, BlockFeedSnapshot, BlockRecord, CoreBuilderExt, LbcComposeDeployer, LbcEnv,
+    BlockFeed, BlockFeedExtensionFactory, BlockFeedObservation, BlockFeedObserver,
+    BlockFeedSnapshot, BlockFeedWaitError, BlockRecord, CoreBuilderExt, LbcComposeDeployer, LbcEnv,
     LbcK8sDeployer, LbcK8sManualCluster, LbcLocalDeployer, LbcManualCluster, NodeHeadSnapshot,
-    ScenarioBuilder, ScenarioBuilderExt,
+    ObservedBlock, ScenarioBuilder, ScenarioBuilderExt, block_feed_source_provider,
+    block_feed_sources, named_block_feed_sources,
 };
 // Required by reused node-test config modules importing from crate root.
 pub use node::configs::deployment::{DeploymentBuilder, TopologyConfig};
@@ -56,4 +57,11 @@ pub mod prelude {
         CoreBuilderExt as _, LbcLocalDeployer, LbcManualCluster, ScenarioBuilder,
         ScenarioBuilderExt as _,
     };
+}
+
+#[must_use]
+pub fn is_truthy_env(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
 }

@@ -56,11 +56,10 @@ pub struct DeploymentSettings {
 impl From<WellKnownDeployment> for DeploymentSettings {
     fn from(value: WellKnownDeployment) -> Self {
         match value {
-            WellKnownDeployment::Devnet => deserialize_config_from_reader(
-                devnet::SERIALIZED_DEPLOYMENT.as_bytes(),
-                OnUnknownKeys::Fail,
-            )
-            .expect("Devnet deployment config is valid."),
+            WellKnownDeployment::Devnet => {
+                deserialize_config_from_reader(devnet::SERIALIZED_DEPLOYMENT, OnUnknownKeys::Fail)
+                    .expect("Devnet deployment config is valid.")
+            }
         }
     }
 }
@@ -84,5 +83,12 @@ mod tests {
     #[test]
     fn devnet_initialization() {
         drop(DeploymentSettings::from(WellKnownDeployment::Devnet));
+    }
+
+    #[test]
+    fn serialize_deserialize_yaml() {
+        let settings = DeploymentSettings::from(WellKnownDeployment::Devnet);
+        let as_str = serde_yaml::to_string(&settings).unwrap();
+        let _recovered: DeploymentSettings = serde_yaml::from_str(&as_str).unwrap();
     }
 }

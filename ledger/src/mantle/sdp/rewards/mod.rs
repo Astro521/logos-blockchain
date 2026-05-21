@@ -6,11 +6,11 @@ use std::collections::HashMap;
 
 use lb_core::{
     block::BlockNumber,
-    crypto::{ZkDigest, ZkHasher},
-    mantle::{Note, TxHash, Utxo, Value},
+    codec::SerializeOp as _,
+    crypto::{Digest, Hash, Hasher},
+    mantle::{Note, Utxo, Value},
     sdp::{ActivityMetadata, ProviderId, ServiceParameters, ServiceType, SessionNumber},
 };
-use lb_groth16::{Fr, fr_from_bytes};
 use lb_key_management_system_keys::keys::ZkPublicKey;
 use thiserror::Error;
 
@@ -26,6 +26,9 @@ pub type RewardAmount = u64;
 /// and can calculate expected rewards for each provider based on the service's
 /// internal logic.
 pub trait Rewards: Clone + PartialEq + Send + Sync + std::fmt::Debug {
+    /// Service-specific reward parameters.
+    type Params;
+
     /// Update rewards state when an active message is received.
     ///
     /// Called when a provider submits an active message with metadata
@@ -35,13 +38,14 @@ pub trait Rewards: Clone + PartialEq + Send + Sync + std::fmt::Debug {
         declaration_id: ProviderId,
         metadata: &ActivityMetadata,
         block_number: BlockNumber,
+        params: &Self::Params,
     ) -> Result<Self, Error>;
 
     /// Update rewards state when sessions transition and calculate rewards to
     /// distribute.
     ///
     /// Called during session boundaries when active, `past_session`, and
-    /// forming sessions are updated. Returns a map of `ProviderId` to
+    /// next sessions are updated. Returns a map of `ProviderId` to
     /// reward amounts for providers eligible for rewards in this session
     /// transition.
     ///
@@ -57,6 +61,7 @@ pub trait Rewards: Clone + PartialEq + Send + Sync + std::fmt::Debug {
         last_active: &SessionState,
         next_session_first_epoch_state: &EpochState,
         config: &ServiceParameters,
+        params: &Self::Params,
     ) -> (Self, Vec<Utxo>);
 
     /// Update rewards state when a new epoch begins while the session remains
@@ -65,7 +70,7 @@ pub trait Rewards: Clone + PartialEq + Send + Sync + std::fmt::Debug {
     /// If the epoch has already been processed previously, this method performs
     /// no update and returns the current state unchanged.
     #[must_use]
-    fn update_epoch(&self, epoch_state: &EpochState) -> Self;
+    fn update_epoch(&self, epoch_state: &EpochState, params: &Self::Params) -> Self;
     #[must_use]
     fn add_income(&self, income: Value) -> Self;
 }
@@ -90,6 +95,8 @@ pub enum Error {
     InvalidProofType,
     #[error("Invalid proof")]
     InvalidProof,
+    #[error("Hamming distance too large")]
+    HammingDistanceTooLarge,
     #[error("Unknown provider: {0:?}")]
     UnknownProvider(Box<ProviderId>),
 }
@@ -99,15 +106,17 @@ pub enum Error {
 /// The hash is computed from a version constant, session number, and service
 /// type, ensuring all nodes produce identical transaction hashes for reward
 /// notes.
-fn create_reward_tx_hash(session_n: SessionNumber, service_type: ServiceType) -> TxHash {
-    let mut hasher = ZkHasher::default();
-    let session_fr = Fr::from(session_n);
-    let service_type_fr = fr_from_bytes(service_type.as_ref().as_bytes())
-        .expect("Valid service type fr representation");
-    <ZkHasher as ZkDigest>::update(&mut hasher, &service_type_fr);
-    <ZkHasher as ZkDigest>::update(&mut hasher, &session_fr);
+fn create_reward_op_id(session_n: SessionNumber, service_type: ServiceType) -> Hash {
+    let mut hasher = Hasher::default();
+    let session_u8 = session_n.to_le_bytes().to_vec();
+    let service_type_u8 = service_type
+        .to_bytes()
+        .expect("conversion to bytes should succeed")
+        .to_vec();
+    <Hasher as Digest>::update(&mut hasher, &service_type_u8);
+    <Hasher as Digest>::update(&mut hasher, &session_u8);
 
-    TxHash(hasher.finalize())
+    hasher.finalize().into()
 }
 
 /// Distributes rewards as UTXOs, sorted by `zk_id` for determinism.
@@ -127,13 +136,13 @@ fn distribute_rewards(
         .collect();
     sorted_rewards.sort_by_key(|(zk_id, _)| *zk_id);
 
-    let tx_hash = create_reward_tx_hash(session_n, service_type);
+    let op_id = create_reward_op_id(session_n, service_type);
 
     sorted_rewards
         .into_iter()
         .enumerate()
         .map(|(output_index, (zk_id, reward_amount))| {
-            Utxo::new(tx_hash, output_index, Note::new(reward_amount, zk_id))
+            Utxo::new(op_id, output_index, Note::new(reward_amount, zk_id))
         })
         .collect()
 }

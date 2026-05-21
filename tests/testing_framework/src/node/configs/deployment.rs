@@ -1,8 +1,8 @@
 use std::{collections::HashMap, error::Error, path::PathBuf, sync::Arc, time::Duration};
 
-use lb_core::mantle::genesis_tx::GenesisTx;
+use lb_config::kms::key_id_for_preload_backend;
+use lb_core::block::genesis::GenesisBlock;
 use lb_node::config::RunConfig;
-use lb_utils::net::get_available_udp_port;
 use rand::{Rng, SeedableRng as _};
 use testing_framework_core::topology::{DeploymentProvider, DeploymentSeed, DynTopologyError};
 use thiserror::Error;
@@ -11,9 +11,12 @@ use super::{
     Libp2pNetworkLayout, NetworkParams,
     wallet::{WalletConfig, WalletConfigError},
 };
-use crate::node::{
-    DeploymentPlan, NodePlan,
-    configs::{Config, create_node_configs_from_ids, key_id_for_preload_backend, postprocess},
+use crate::{
+    get_reserved_available_udp_port,
+    node::{
+        DeploymentPlan, NodePlan,
+        configs::{Config, create_node_configs_from_ids, postprocess},
+    },
 };
 
 pub type DynError = Box<dyn Error + Send + Sync + 'static>;
@@ -39,22 +42,25 @@ pub enum TopologyBuildError {
 #[derive(Clone)]
 pub struct TopologyConfig {
     pub n_nodes: usize,
+    pub blend_core_nodes: usize,
     pub network_params: Arc<NetworkParams>,
     pub wallet_config: WalletConfig,
     pub scenario_base_dir: PathBuf,
-    pub genesis_tx: Option<GenesisTx>,
+    pub genesis_block: Option<GenesisBlock>,
     pub slot_duration: Option<Duration>,
     pub active_slot_coeff: f64,
     pub security_param: u32,
     node_config_overrides: HashMap<usize, RunConfig>,
     allow_multiple_genesis_tokens: bool,
     allow_zero_value_genesis_tokens: bool,
+    pub test_context: Option<String>,
 }
 
 impl TopologyConfig {
     fn with_node_count(nodes: usize) -> Self {
         Self {
             n_nodes: nodes,
+            blend_core_nodes: nodes,
             ..Self::default()
         }
     }
@@ -72,6 +78,12 @@ impl TopologyConfig {
     }
 
     #[must_use]
+    pub fn with_test_context(mut self, test_context: Option<String>) -> Self {
+        self.test_context = test_context;
+        self
+    }
+
+    #[must_use]
     pub fn empty() -> Self {
         Self::with_node_count(0)
     }
@@ -79,6 +91,12 @@ impl TopologyConfig {
     #[must_use]
     pub fn with_node_numbers(nodes: usize) -> Self {
         Self::with_node_count(nodes)
+    }
+
+    #[must_use]
+    pub const fn with_blend_core_nodes(mut self, blend_core_nodes: usize) -> Self {
+        self.blend_core_nodes = blend_core_nodes;
+        self
     }
 
     #[must_use]
@@ -91,16 +109,18 @@ impl Default for TopologyConfig {
     fn default() -> Self {
         Self {
             n_nodes: 0,
+            blend_core_nodes: 0,
             network_params: Arc::new(NetworkParams::default()),
             wallet_config: WalletConfig::default(),
             scenario_base_dir: std::env::temp_dir(),
-            genesis_tx: None,
+            genesis_block: None,
             slot_duration: Some(Duration::from_secs(DEFAULT_SLOT_TIME_IN_SECS)),
             active_slot_coeff: DEFAULT_ACTIVE_SLOT_COEFF,
             security_param: DEFAULT_SECURITY_PARAM,
             node_config_overrides: HashMap::new(),
             allow_multiple_genesis_tokens: false,
             allow_zero_value_genesis_tokens: false,
+            test_context: None,
         }
     }
 }
@@ -161,6 +181,12 @@ impl DeploymentBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_test_context(mut self, test_context: &str) -> Self {
+        self.config.test_context = Some(test_context.to_owned());
+        self
+    }
+
     pub fn build(mut self) -> Result<DeploymentPlan, TopologyBuildError> {
         self.config.wallet_config.validate(
             self.config.allow_multiple_genesis_tokens,
@@ -172,14 +198,21 @@ impl DeploymentBuilder {
             return Ok(DeploymentPlan::new(self.config, Vec::new()));
         }
 
+        assert!(
+            self.config.blend_core_nodes <= node_count,
+            "blend_core_nodes({}) must be <= n_nodes({node_count})",
+            self.config.blend_core_nodes
+        );
+
         let ids = generate_node_ids(node_count, self.seed.as_ref());
 
         let blend_ports = allocate_blend_ports(node_count)?;
-        let (mut node_configs, base_genesis_tx) = create_node_configs_from_ids(
+        let (mut node_configs, genesis_block) = create_node_configs_from_ids(
             &ids,
             &blend_ports,
-            node_count,
+            self.config.blend_core_nodes,
             self.config.network_params.as_ref(),
+            self.config.test_context.as_deref(),
         );
 
         let wallet_accounts = self
@@ -190,15 +223,17 @@ impl DeploymentBuilder {
             .map(|account| (account.secret_key.clone(), account.value))
             .collect::<Vec<_>>();
 
-        let genesis_tx = postprocess::apply_wallet_genesis_overrides(
+        let genesis_block = postprocess::apply_wallet_genesis_overrides(
             &mut node_configs,
-            &base_genesis_tx,
+            &genesis_block,
+            self.config.blend_core_nodes,
             &wallet_accounts,
             key_id_for_preload_backend,
+            self.config.test_context.as_deref(),
         );
 
         let nodes = build_node_plans(node_count, &ids, &node_configs)?;
-        self.config.genesis_tx = Some(genesis_tx);
+        self.config.genesis_block = Some(genesis_block);
 
         Ok(DeploymentPlan::new(self.config, nodes))
     }
@@ -208,7 +243,7 @@ fn allocate_blend_ports(node_count: usize) -> Result<Vec<u16>, TopologyBuildErro
     let mut ports = Vec::with_capacity(node_count);
 
     for _ in 0..node_count {
-        let Some(port) = get_available_udp_port() else {
+        let Some(port) = get_reserved_available_udp_port() else {
             return Err(TopologyBuildError::BlendPortAllocation);
         };
         ports.push(port);

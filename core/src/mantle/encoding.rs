@@ -1,5 +1,7 @@
 use lb_groth16::{CompressedGroth16Proof, Fr, fr_from_bytes};
 use lb_key_management_system_keys::keys::{Ed25519Signature, ZkPublicKey, ZkSignature};
+use lb_utils::bounded_vec::BoundedVec;
+use multiaddr::Multiaddr;
 use nom::{
     IResult, Parser as _,
     bytes::complete::take,
@@ -9,16 +11,15 @@ use nom::{
     number::complete::{le_u16, le_u32, le_u64, u8 as decode_u8},
     sequence::pair,
 };
+use time::OffsetDateTime;
 
 use crate::{
     mantle::{
         MantleTx, Note, NoteId, SignedMantleTx,
+        nom::{NomBoundedVec, NomDecode as _, NomEncode as _},
         ops::{
             Op, OpProof,
-            channel::{
-                ChannelId, Ed25519PublicKey, MsgId, deposit::DepositOp, inscribe::InscriptionOp,
-                set_keys::SetKeysOp,
-            },
+            channel::{ChannelId, Ed25519PublicKey, config::ChannelConfigOp, deposit::DepositOp},
             leader_claim::{LeaderClaimOp, RewardsRoot, VoucherNullifier},
             sdp::{SDPActiveOp, SDPDeclareOp, SDPWithdrawOp},
             transfer::TransferOp,
@@ -29,13 +30,34 @@ use crate::{
 };
 
 // ==============================================================================
+// Memory Safety Limits
+// ==============================================================================
+// These limits are not designed to mimic system limits, but rather to prevent
+// unbounded memory usage from malicious inputs. They prevent memory
+// over-allocation attacks where untrusted input specifies allocation sizes.
+// Values are chosen to not limit normal operations while preventing excessive
+// memory usage (e.g., 68GB allocation). As an example, if the network currently
+// limits maximum transaction size to 1MiB, for memory safety limits we can
+// allow 4MiB.
+
+// Maximum memory allocation size allowed for SDP activity metadata.
+// Protects against unbounded allocation in `decode_sdp_active`
+const MAX_ENCODE_DECODE_METADATA_SIZE: u32 = 234; // `ActiveMessage` has a fixed size of 234 bytes
+
+// Maximum byte size allowed for a locator in SDPDeclare operations.
+const LOCATOR_BYTES_SIZE_LIMIT: usize = 329usize;
+
+pub type Ops = BoundedVec<Op, { u8::MAX as usize }>;
+type NomOps<'a> = NomBoundedVec<'a, Op, { u8::MAX as usize }, 1>;
+
+// ==============================================================================
 // Top-Level Transaction Decoders
 // ==============================================================================
 
 pub fn decode_signed_mantle_tx(input: &[u8]) -> IResult<&[u8], SignedMantleTx> {
     // SignedMantleTx = MantleTx OpsProofs
     let (input, mantle_tx) = decode_mantle_tx(input)?;
-    let (input, ops_proofs) = decode_ops_proofs(input, &mantle_tx.ops)?;
+    let (input, ops_proofs) = decode_ops_proofs(input, mantle_tx.ops())?;
 
     let signed_tx = SignedMantleTx::new(mantle_tx, ops_proofs)
         .map_err(|_| nom::Err::Error(Error::new(input, ErrorKind::Verify)))?;
@@ -45,87 +67,45 @@ pub fn decode_signed_mantle_tx(input: &[u8]) -> IResult<&[u8], SignedMantleTx> {
 
 pub fn decode_mantle_tx(input: &[u8]) -> IResult<&[u8], MantleTx> {
     // MantleTx = Ops ExecutionGasPrice StorageGasPrice
-    let (input, ops) = decode_ops(input)?;
-    let (input, execution_gas_price) = decode_uint64(input)?;
-    let (input, storage_gas_price) = decode_uint64(input)?;
+    let (input, ops) = NomOps::decode(input)?;
 
-    Ok((
-        input,
-        MantleTx {
-            ops,
-            execution_gas_price: execution_gas_price.into(),
-            storage_gas_price: storage_gas_price.into(),
-        },
-    ))
-}
-
-// ==============================================================================
-// Operation List Decoders
-// ==============================================================================
-
-pub fn decode_ops(input: &[u8]) -> IResult<&[u8], Vec<Op>> {
-    // Ops = OpCount *Op
-    let (input, op_count) = decode_byte(input)?;
-    count(decode_op, op_count as usize).parse(input)
-}
-
-pub fn decode_op(input: &[u8]) -> IResult<&[u8], Op> {
-    // Op = Opcode OpPayload
-    let (input, opcode) = decode_byte(input)?;
-
-    match opcode {
-        opcode::INSCRIBE => map(decode_channel_inscribe, Op::ChannelInscribe).parse(input),
-        opcode::SET_CHANNEL_KEYS => map(decode_channel_set_keys, Op::ChannelSetKeys).parse(input),
-        opcode::CHANNEL_DEPOSIT => map(decode_channel_deposit, Op::ChannelDeposit).parse(input),
-        opcode::CHANNEL_WITHDRAW => map(decode_channel_withdraw, Op::ChannelWithdraw).parse(input),
-        opcode::SDP_DECLARE => map(decode_sdp_declare, Op::SDPDeclare).parse(input),
-        opcode::SDP_WITHDRAW => map(decode_sdp_withdraw, Op::SDPWithdraw).parse(input),
-        opcode::SDP_ACTIVE => map(decode_sdp_active, Op::SDPActive).parse(input),
-        opcode::LEADER_CLAIM => map(decode_leader_claim, Op::LeaderClaim).parse(input),
-        opcode::TRANSFER => map(decode_transfer, Op::Transfer).parse(input),
-        _ => Err(nom::Err::Error(Error::new(input, ErrorKind::Fail))),
-    }
+    Ok((input, MantleTx(ops)))
 }
 
 // ==============================================================================
 // Channel Operation Decoders
 // ==============================================================================
 
-fn decode_channel_inscribe(input: &[u8]) -> IResult<&[u8], InscriptionOp> {
-    // ChannelInscribe = ChannelId Inscription Parent Signer
-    // Inscription = UINT32 *BYTE
-    // Signer = Ed25519PublicKey
-    let (input, channel_id) = map(decode_hash32, ChannelId::from).parse(input)?;
-    let (input, inscription_len) = decode_uint32(input)?;
-    let (input, inscription) =
-        map(take(inscription_len as usize), |b: &[u8]| b.to_vec()).parse(input)?;
-    let (input, parent) = map(decode_hash32, MsgId::from).parse(input)?;
-    let (input, signer) = decode_ed25519_public_key(input)?;
+pub(crate) fn decode_channel_config(input: &[u8]) -> IResult<&[u8], ChannelConfigOp> {
+    // ChannelConfig = ChannelId KeyCount *Ed25519PublicKey PostingTimeframe
+    // PostingTimeout ConfigThreshold WithdrawThreshold
+    let (input, channel) = map(decode_hash32, ChannelId::from).parse(input)?;
+    let (input, key_count) = decode_byte(input)?;
+
+    let (input, keys) = count(decode_ed25519_public_key, key_count as usize).parse(input)?;
+
+    let (input, posting_timeframe) = decode_uint32(input)?;
+    let (input, posting_timeout) = decode_uint32(input)?;
+    let (input, configuration_threshold) = decode_uint16(input)?;
+    let (input, withdraw_threshold) = decode_uint16(input)?;
 
     Ok((
         input,
-        InscriptionOp {
-            channel_id,
-            inscription,
-            parent,
-            signer,
+        ChannelConfigOp {
+            channel,
+            keys,
+            posting_timeframe: SlotTimeframe::from(posting_timeframe),
+            posting_timeout: SlotTimeout::from(posting_timeout),
+            configuration_threshold,
+            withdraw_threshold,
         },
     ))
 }
 
-fn decode_channel_set_keys(input: &[u8]) -> IResult<&[u8], SetKeysOp> {
-    // ChannelSetKeys = ChannelId KeyCount *Ed25519PublicKey
-    let (input, channel) = map(decode_hash32, ChannelId::from).parse(input)?;
-    let (input, key_count) = decode_byte(input)?;
-    let (input, keys) = count(decode_ed25519_public_key, key_count as usize).parse(input)?;
-
-    Ok((input, SetKeysOp { channel, keys }))
-}
-
-fn decode_channel_deposit(input: &[u8]) -> IResult<&[u8], DepositOp> {
+pub(crate) fn decode_channel_deposit(input: &[u8]) -> IResult<&[u8], DepositOp> {
     // ChannelDeposit = ChannelId Amount Metadata
     let (input, channel_id) = map(decode_hash32, ChannelId::from).parse(input)?;
-    let (input, amount) = decode_uint64(input)?;
+    let (input, inputs) = decode_inputs(input)?;
     let (input, metadata_len) = decode_uint32(input)?;
     let (input, metadata) =
         map(take(metadata_len as usize), |bytes: &[u8]| bytes.to_vec()).parse(input)?;
@@ -134,24 +114,32 @@ fn decode_channel_deposit(input: &[u8]) -> IResult<&[u8], DepositOp> {
         input,
         DepositOp {
             channel_id,
-            amount,
+            inputs,
             metadata,
         },
     ))
 }
 
-fn decode_channel_withdraw(input: &[u8]) -> IResult<&[u8], ChannelWithdrawOp> {
+pub(crate) fn decode_channel_withdraw(input: &[u8]) -> IResult<&[u8], ChannelWithdrawOp> {
     // ChannelWithdraw = ChannelId Amount
     let (input, channel_id) = map(decode_hash32, ChannelId::from).parse(input)?;
-    let (input, amount) = decode_uint64(input)?;
-    Ok((input, ChannelWithdrawOp { channel_id, amount }))
+    let (input, outputs) = decode_outputs(input)?;
+    let (input, withdraw_nonce) = decode_uint32(input)?;
+    Ok((
+        input,
+        ChannelWithdrawOp {
+            channel_id,
+            outputs,
+            withdraw_nonce,
+        },
+    ))
 }
 
 // ==============================================================================
 // SDP Operation Decoders
 // ==============================================================================
 
-fn decode_sdp_declare(input: &[u8]) -> IResult<&[u8], SDPDeclareOp> {
+pub(crate) fn decode_sdp_declare(input: &[u8]) -> IResult<&[u8], SDPDeclareOp> {
     // SDPDeclare = ServiceType LocatorCount *Locator ProviderId ZkId LockedNoteId
     let (input, service_type_byte) = decode_byte(input)?;
     let service_type = match service_type_byte {
@@ -159,8 +147,14 @@ fn decode_sdp_declare(input: &[u8]) -> IResult<&[u8], SDPDeclareOp> {
         _ => return Err(nom::Err::Error(Error::new(input, ErrorKind::Fail))),
     };
     let (input, locator_count) = decode_byte(input)?;
+
     let (input, multiaddrs) = count(decode_locator, locator_count as usize).parse(input)?;
-    let locators = multiaddrs.into_iter().map(Locator::new).collect();
+    let locators = multiaddrs
+        .into_iter()
+        .map(Locator::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(TryInto::try_into)
+        .map_err(|_| nom::Err::Error(Error::new(input, ErrorKind::Fail)))?;
     let (input, provider_key) = decode_ed25519_public_key(input)?;
     let provider_id = ProviderId(provider_key);
     let (input, zk_fr) = decode_field_element(input)?;
@@ -179,9 +173,7 @@ fn decode_sdp_declare(input: &[u8]) -> IResult<&[u8], SDPDeclareOp> {
     ))
 }
 
-const LOCATOR_BYTES_SIZE_LIMIT: usize = 329usize;
-
-fn decode_locator(input: &[u8]) -> IResult<&[u8], multiaddr::Multiaddr> {
+fn decode_locator(input: &[u8]) -> IResult<&[u8], Multiaddr> {
     // Locator = 2Byte *BYTE
     let (input, len_bytes) = take(2usize).parse(input)?;
     let len = u16::from_le_bytes([len_bytes[0], len_bytes[1]]) as usize;
@@ -189,13 +181,12 @@ fn decode_locator(input: &[u8]) -> IResult<&[u8], multiaddr::Multiaddr> {
         return Err(nom::Err::Error(Error::new(input, ErrorKind::LengthValue)));
     }
     map_res(take(len), |bytes: &[u8]| {
-        multiaddr::Multiaddr::try_from(bytes.to_vec())
-            .map_err(|_| Error::new(bytes, ErrorKind::Fail))
+        Multiaddr::try_from(bytes.to_vec()).map_err(|_| Error::new(bytes, ErrorKind::Fail))
     })
     .parse(input)
 }
 
-fn decode_sdp_withdraw(input: &[u8]) -> IResult<&[u8], SDPWithdrawOp> {
+pub(crate) fn decode_sdp_withdraw(input: &[u8]) -> IResult<&[u8], SDPWithdrawOp> {
     // SDPWithdraw = DeclarationId Nonce LockedNoteId
     let (input, declaration_id_bytes) = decode_hash32(input)?;
     let declaration_id = DeclarationId(declaration_id_bytes);
@@ -212,7 +203,7 @@ fn decode_sdp_withdraw(input: &[u8]) -> IResult<&[u8], SDPWithdrawOp> {
     ))
 }
 
-fn decode_sdp_active(input: &[u8]) -> IResult<&[u8], SDPActiveOp> {
+pub(crate) fn decode_sdp_active(input: &[u8]) -> IResult<&[u8], SDPActiveOp> {
     // SDPActive = DeclarationId Nonce Metadata
     // Metadata = UINT32 *BYTE
     let (input, declaration_id_bytes) = decode_hash32(input)?;
@@ -221,6 +212,12 @@ fn decode_sdp_active(input: &[u8]) -> IResult<&[u8], SDPActiveOp> {
     let (input, nonce) = decode_uint64(input)?;
 
     let (input, metadata_len) = decode_uint32(input)?;
+
+    // Validate metadata length to prevent unbounded memory allocation
+    if metadata_len > MAX_ENCODE_DECODE_METADATA_SIZE {
+        return Err(nom::Err::Error(Error::new(input, ErrorKind::TooLarge)));
+    }
+
     let (input, metadata_bytes) = take(metadata_len as usize).parse(input)?;
 
     let metadata = ActivityMetadata::from_metadata_bytes(metadata_bytes)
@@ -240,16 +237,18 @@ fn decode_sdp_active(input: &[u8]) -> IResult<&[u8], SDPActiveOp> {
 // Leader Operation Decoders
 // ==============================================================================
 
-fn decode_leader_claim(input: &[u8]) -> IResult<&[u8], LeaderClaimOp> {
+pub(crate) fn decode_leader_claim(input: &[u8]) -> IResult<&[u8], LeaderClaimOp> {
     // LeaderClaim = RewardsRoot VoucherNullifier
     let (input, rewards_root_fr) = decode_field_element(input)?;
     let (input, voucher_nullifier_fr) = decode_field_element(input)?;
+    let (input, pk) = decode_zk_public_key(input)?;
 
     Ok((
         input,
         LeaderClaimOp {
             rewards_root: RewardsRoot::from(rewards_root_fr),
             voucher_nullifier: VoucherNullifier::from(voucher_nullifier_fr),
+            pk,
         },
     ))
 }
@@ -266,19 +265,24 @@ fn decode_note(input: &[u8]) -> IResult<&[u8], Note> {
     Ok((input, Note::new(value, pk)))
 }
 
-fn decode_inputs(input: &[u8]) -> IResult<&[u8], Vec<NoteId>> {
+fn decode_inputs(input: &[u8]) -> IResult<&[u8], Inputs> {
     // Inputs = InputCount *NoteId
     let (input, input_count) = decode_byte(input)?;
-    count(map(decode_field_element, NoteId), input_count as usize).parse(input)
+
+    let (input, note_ids) =
+        count(map(decode_field_element, NoteId), input_count as usize).parse(input)?;
+    Ok((input, Inputs::new(note_ids)))
 }
 
-fn decode_outputs(input: &[u8]) -> IResult<&[u8], Vec<Note>> {
+fn decode_outputs(input: &[u8]) -> IResult<&[u8], Outputs> {
     // Outputs = OutputCount *Note
     let (input, output_count) = decode_byte(input)?;
-    count(decode_note, output_count as usize).parse(input)
+    let (input, notes) = count(decode_note, output_count as usize).parse(input)?;
+
+    Ok((input, Outputs::new(notes)))
 }
 
-fn decode_transfer(input: &[u8]) -> IResult<&[u8], TransferOp> {
+pub(crate) fn decode_transfer(input: &[u8]) -> IResult<&[u8], TransferOp> {
     // Transfer = Inputs Outputs
     let (input, inputs) = decode_inputs(input)?;
     let (input, outputs) = decode_outputs(input)?;
@@ -306,9 +310,7 @@ fn decode_ops_proofs<'a>(input: &'a [u8], ops: &[Op]) -> IResult<&'a [u8], Vec<O
 fn decode_op_proof<'a>(input: &'a [u8], op: &Op) -> IResult<&'a [u8], OpProof> {
     match op {
         // Ed25519SigProof = Ed25519Signature
-        Op::ChannelInscribe(_) | Op::ChannelSetKeys(_) => {
-            map(decode_ed25519_signature, OpProof::Ed25519Sig).parse(input)
-        }
+        Op::ChannelInscribe(_) => map(decode_ed25519_signature, OpProof::Ed25519Sig).parse(input),
 
         // ZkAndEd25519SigsProof = ZkSignature Ed25519Signature
         Op::SDPDeclare(_) => {
@@ -324,7 +326,7 @@ fn decode_op_proof<'a>(input: &'a [u8], op: &Op) -> IResult<&'a [u8], OpProof> {
         }
 
         // ZkSigProof = ZkSignature
-        Op::SDPWithdraw(_) | Op::SDPActive(_) | Op::Transfer(_) => {
+        Op::SDPWithdraw(_) | Op::SDPActive(_) | Op::Transfer(_) | Op::ChannelDeposit(_) => {
             map(decode_zk_signature, OpProof::ZkSig).parse(input)
         }
 
@@ -337,13 +339,12 @@ fn decode_op_proof<'a>(input: &'a [u8], op: &Op) -> IResult<&'a [u8], OpProof> {
         })
         .parse(input),
 
-        // ChannelWithdrawProof
-        Op::ChannelWithdraw(_) => {
-            map(decode_channel_withdraw_proof, OpProof::ChannelWithdrawProof).parse(input)
-        }
-
-        // None. It's indirectly signed through the Ledger Transaction signature.
-        Op::ChannelDeposit(_) => Ok((input, OpProof::NoProof)),
+        // ChannelMultiSigProof — also used by ChannelConfig (threshold sigs)
+        Op::ChannelWithdraw(_) | Op::ChannelConfig(_) => map(
+            decode_channel_multi_sig_proof,
+            OpProof::ChannelMultiSigProof,
+        )
+        .parse(input),
     }
 }
 
@@ -372,7 +373,7 @@ fn decode_zk_public_key(input: &[u8]) -> IResult<&[u8], ZkPublicKey> {
 }
 
 const ED25519_PK_BYTES: usize = 32;
-fn decode_ed25519_public_key(input: &[u8]) -> IResult<&[u8], Ed25519PublicKey> {
+pub(crate) fn decode_ed25519_public_key(input: &[u8]) -> IResult<&[u8], Ed25519PublicKey> {
     // Ed25519PublicKey = 32BYTE
     map_res(
         decode_array::<ED25519_PK_BYTES>,
@@ -393,14 +394,13 @@ fn decode_ed25519_signature(input: &[u8]) -> IResult<&[u8], Ed25519Signature> {
     .parse(input)
 }
 
-const fn calculate_channel_withdraw_proof_byte_size(
-    channel_withdraw_threshold: ChannelKeyIndex,
-) -> usize {
-    (channel_withdraw_threshold as usize) * (ED25519_SIG_BYTES + 4)
+const fn calculate_channel_multi_sig_proof_byte_size(threshold: ChannelKeyIndex) -> usize {
+    // Encoding: u16 signature count + N * (Ed25519 sig + u16 key index)
+    2 + (threshold as usize) * (ED25519_SIG_BYTES + 2)
 }
 
-fn decode_channel_withdraw_proof(input: &[u8]) -> IResult<&[u8], ChannelWithdrawProof> {
-    // ChannelWithdrawProof = SignatureCount *WithdrawSignature
+fn decode_channel_multi_sig_proof(input: &[u8]) -> IResult<&[u8], ChannelMultiSigProof> {
+    // ChannelMultiSigProof = SignatureCount *WithdrawSignature
     // WithdrawSignature = Ed25519Signature Index
     let (input, signatures) = length_count(
         map(decode_uint16, |n: ChannelKeyIndex| n as usize),
@@ -408,17 +408,17 @@ fn decode_channel_withdraw_proof(input: &[u8]) -> IResult<&[u8], ChannelWithdraw
     )
     .parse(input)?;
 
-    let signatures: Vec<WithdrawSignature> = signatures
+    let signatures: Vec<IndexedSignature> = signatures
         .into_iter()
-        .map(|(signature, index)| WithdrawSignature::from((index, signature)))
+        .map(|(signature, index)| IndexedSignature::from((index, signature)))
         .collect();
 
-    ChannelWithdrawProof::new(signatures)
+    ChannelMultiSigProof::new(signatures)
         .map(|proof| (input, proof))
         .map_err(|_| nom::Err::Failure(Error::new(input, ErrorKind::Verify)))
 }
 
-fn decode_field_element(input: &[u8]) -> IResult<&[u8], Fr> {
+pub(crate) fn decode_field_element(input: &[u8]) -> IResult<&[u8], Fr> {
     // FieldElement = 32BYTE
     map_res(take(32usize), |bytes: &[u8]| {
         fr_from_bytes(bytes).map_err(|_| "Invalid field element")
@@ -426,7 +426,7 @@ fn decode_field_element(input: &[u8]) -> IResult<&[u8], Fr> {
     .parse(input)
 }
 
-fn decode_hash32(input: &[u8]) -> IResult<&[u8], [u8; 32]> {
+pub(crate) fn decode_hash32(input: &[u8]) -> IResult<&[u8], [u8; 32]> {
     // Hash32 = 32BYTE
     decode_array::<32>(input)
 }
@@ -443,17 +443,26 @@ fn decode_array<const N: usize>(input: &[u8]) -> IResult<&[u8], [u8; N]> {
     .parse(input)
 }
 
+pub(crate) fn decode_utf8_string(input: &[u8], len: usize) -> IResult<&[u8], String> {
+    map_res(take(len), |bytes: &[u8]| {
+        std::str::from_utf8(bytes)
+            .map(ToOwned::to_owned)
+            .map_err(|_| Error::new(bytes, ErrorKind::Fail))
+    })
+    .parse(input)
+}
+
 fn decode_uint16(input: &[u8]) -> IResult<&[u8], u16> {
     // UINT16 = 2BYTE
     le_u16(input)
 }
 
-fn decode_uint32(input: &[u8]) -> IResult<&[u8], u32> {
+pub(crate) fn decode_uint32(input: &[u8]) -> IResult<&[u8], u32> {
     // UINT32 = 4BYTE
     le_u32(input)
 }
 
-fn decode_uint64(input: &[u8]) -> IResult<&[u8], u64> {
+pub(crate) fn decode_uint64(input: &[u8]) -> IResult<&[u8], u64> {
     // UINT64 = 8BYTE
     le_u64(input)
 }
@@ -463,31 +472,44 @@ fn decode_byte(input: &[u8]) -> IResult<&[u8], u8> {
     decode_u8(input)
 }
 
+pub(crate) fn decode_unix_timestamp(input: &[u8]) -> IResult<&[u8], OffsetDateTime> {
+    // Timestamp = UINT64
+    map_res(decode_uint64, |ts| {
+        OffsetDateTime::from_unix_timestamp(
+            ts.try_into()
+                .map_err(|_| Error::new(input, ErrorKind::Fail))?,
+        )
+        .map_err(|_| Error::new(input, ErrorKind::Fail))
+    })
+    .parse(input)
+}
+
 // ==============================================================================
 // Binary Encoders
 // ==============================================================================
 
 use lb_groth16::fr_to_bytes;
 
-use super::ops::opcode;
 use crate::{
     mantle::{
+        channel::{SlotTimeframe, SlotTimeout},
+        ledger::{Inputs, Outputs},
         ops::channel::{ChannelKeyIndex, withdraw::ChannelWithdrawOp},
         tx::MantleTxGasContext,
     },
-    proofs::channel_withdraw_proof::{ChannelWithdrawProof, WithdrawSignature},
+    proofs::channel_multi_sig_proof::{ChannelMultiSigProof, IndexedSignature},
 };
-// Encode primitives
 
+/// Encode primitives
 fn encode_uint16(value: u16) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
-fn encode_uint32(value: u32) -> Vec<u8> {
+pub(crate) fn encode_uint32(value: u32) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
-fn encode_uint64(value: u64) -> Vec<u8> {
+pub(crate) fn encode_uint64(value: u64) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }
 
@@ -495,11 +517,23 @@ fn encode_byte(value: u8) -> Vec<u8> {
     vec![value]
 }
 
-fn encode_hash32(hash: &[u8; 32]) -> Vec<u8> {
+pub(crate) fn encode_string(s: &String) -> Vec<u8> {
+    s.as_bytes().to_vec()
+}
+
+pub(crate) fn encode_unix_timestamp(ts: &OffsetDateTime) -> Vec<u8> {
+    encode_uint64(
+        ts.unix_timestamp()
+            .try_into()
+            .expect("timestamp fits in u64"),
+    )
+}
+
+pub(crate) fn encode_hash32(hash: &[u8; 32]) -> Vec<u8> {
     hash.to_vec()
 }
 
-fn encode_field_element(fr: &Fr) -> Vec<u8> {
+pub(crate) fn encode_field_element(fr: &Fr) -> Vec<u8> {
     fr_to_bytes(fr).to_vec()
 }
 
@@ -508,7 +542,7 @@ fn encode_ed25519_signature(sig: &Ed25519Signature) -> Vec<u8> {
     sig.to_bytes().to_vec()
 }
 
-fn encode_ed25519_public_key(key: &Ed25519PublicKey) -> Vec<u8> {
+pub(crate) fn encode_ed25519_public_key(key: &Ed25519PublicKey) -> Vec<u8> {
     key.to_bytes().to_vec()
 }
 
@@ -526,7 +560,7 @@ fn encode_groth16_proof(proof: &CompressedGroth16Proof) -> Vec<u8> {
     proof.to_bytes().to_vec()
 }
 
-fn encode_channel_withdraw_proof(proof: &ChannelWithdrawProof) -> Vec<u8> {
+fn encode_channel_multi_sig_proof(proof: &ChannelMultiSigProof) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend(encode_uint16(proof.signatures().len() as ChannelKeyIndex));
     bytes.extend(proof.signatures().iter().flat_map(|signature| {
@@ -537,55 +571,70 @@ fn encode_channel_withdraw_proof(proof: &ChannelWithdrawProof) -> Vec<u8> {
     bytes
 }
 
-/// Encode channel operations
 #[must_use]
-pub fn encode_channel_inscribe(op: &InscriptionOp) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend(encode_hash32(op.channel_id.as_ref()));
-    bytes.extend(encode_uint32(op.inscription.len() as u32));
-    bytes.extend(&op.inscription);
-    bytes.extend(encode_hash32(op.parent.as_ref()));
-    bytes.extend(encode_ed25519_public_key(&op.signer));
-    bytes
-}
-
-fn encode_channel_set_keys(op: &SetKeysOp) -> Vec<u8> {
+pub fn encode_channel_config(op: &ChannelConfigOp) -> Vec<u8> {
+    assert!(
+        u8::try_from(op.keys.len()).is_ok(),
+        "Fatal error in 'encode_channel_config' - {} keys clipped to {}",
+        op.keys.len(),
+        u8::MAX
+    );
     let mut bytes = Vec::new();
     bytes.extend(encode_hash32(op.channel.as_ref()));
     bytes.extend(encode_byte(op.keys.len() as u8));
     for key in &op.keys {
         bytes.extend(encode_ed25519_public_key(key));
     }
+
+    bytes.extend(encode_uint32(u32::from(op.posting_timeframe.clone())));
+    bytes.extend(encode_uint32(u32::from(op.posting_timeout.clone())));
+    bytes.extend(encode_uint16(op.configuration_threshold));
+    bytes.extend(encode_uint16(op.withdraw_threshold));
+
     bytes
 }
 
-fn encode_channel_deposit(op: &DepositOp) -> Vec<u8> {
+#[must_use]
+pub(crate) fn encode_channel_deposit(op: &DepositOp) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend(encode_hash32(op.channel_id.as_ref()));
-    bytes.extend(encode_uint64(op.amount));
+    bytes.extend(encode_inputs(op.inputs.as_ref()));
     bytes.extend(encode_uint32(op.metadata.len() as u32));
     bytes.extend(op.metadata.as_slice());
     bytes
 }
 
-fn encode_channel_withdraw(op: &ChannelWithdrawOp) -> Vec<u8> {
+#[must_use]
+pub fn encode_channel_withdraw(op: &ChannelWithdrawOp) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend(encode_hash32(op.channel_id.as_ref()));
-    bytes.extend(encode_uint64(op.amount));
+    bytes.extend(encode_outputs(op.outputs.as_ref()));
+    bytes.extend(encode_uint32(op.withdraw_nonce));
     bytes
 }
 
 /// Encode SDP operations
-fn encode_locator(locator: &multiaddr::Multiaddr) -> Vec<u8> {
+fn encode_locator(locator: &Multiaddr) -> Vec<u8> {
     let locator_bytes = locator.to_vec();
-    assert!(locator_bytes.len() <= LOCATOR_BYTES_SIZE_LIMIT);
+    assert!(
+        locator_bytes.len() <= LOCATOR_BYTES_SIZE_LIMIT,
+        "Fatal error in 'encode_locator' - {} locator bytes clipped to \
+            {LOCATOR_BYTES_SIZE_LIMIT}",
+        locator_bytes.len()
+    );
     let mut bytes = Vec::new();
     bytes.extend((locator_bytes.len() as u16).to_le_bytes());
     bytes.extend(locator_bytes);
     bytes
 }
 
-fn encode_sdp_declare(op: &SDPDeclareOp) -> Vec<u8> {
+pub(crate) fn encode_sdp_declare(op: &SDPDeclareOp) -> Vec<u8> {
+    assert!(
+        u8::try_from(op.locators.len()).is_ok(),
+        "Fatal error in 'encode_sdp_declare' - {} locators clipped to {}",
+        op.locators.len(),
+        u8::MAX
+    );
     let mut bytes = Vec::new();
     // ServiceType
     let service_type_byte = match op.service_type {
@@ -606,7 +655,7 @@ fn encode_sdp_declare(op: &SDPDeclareOp) -> Vec<u8> {
     bytes
 }
 
-fn encode_sdp_withdraw(op: &SDPWithdrawOp) -> Vec<u8> {
+pub(crate) fn encode_sdp_withdraw(op: &SDPWithdrawOp) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend(encode_hash32(&op.declaration_id.0));
     bytes.extend(encode_uint64(op.nonce));
@@ -622,6 +671,12 @@ pub fn encode_sdp_active(op: &SDPActiveOp) -> Vec<u8> {
 
     // Metadata - convert ActivityMetadata to bytes
     let metadata_bytes = op.metadata.to_metadata_bytes();
+    assert!(
+        metadata_bytes.len() <= MAX_ENCODE_DECODE_METADATA_SIZE as usize,
+        "Fatal error in 'encode_sdp_active' - {} metadata bytes clipped to {}",
+        metadata_bytes.len(),
+        MAX_ENCODE_DECODE_METADATA_SIZE
+    );
 
     bytes.extend(encode_uint32(metadata_bytes.len() as u32));
     bytes.extend(&metadata_bytes);
@@ -629,10 +684,12 @@ pub fn encode_sdp_active(op: &SDPActiveOp) -> Vec<u8> {
 }
 
 /// Encode leader operations
-fn encode_leader_claim(op: &LeaderClaimOp) -> Vec<u8> {
+#[must_use]
+pub fn encode_leader_claim(op: &LeaderClaimOp) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend(encode_field_element(&op.rewards_root.into()));
     bytes.extend(encode_field_element(&op.voucher_nullifier.into()));
+    bytes.extend(encode_field_element(op.pk.as_fr()));
     bytes
 }
 
@@ -645,6 +702,12 @@ fn encode_note(note: &Note) -> Vec<u8> {
 }
 
 fn encode_inputs(inputs: &[NoteId]) -> Vec<u8> {
+    assert!(
+        u8::try_from(inputs.len()).is_ok(),
+        "Fatal error in 'encode_inputs' - {} inputs clipped to {}",
+        inputs.len(),
+        u8::MAX
+    );
     let mut bytes = Vec::new();
     bytes.extend(encode_byte(inputs.len() as u8));
     for input in inputs {
@@ -655,6 +718,12 @@ fn encode_inputs(inputs: &[NoteId]) -> Vec<u8> {
 
 fn encode_outputs(outputs: &[Note]) -> Vec<u8> {
     let mut bytes = Vec::new();
+    assert!(
+        u8::try_from(outputs.len()).is_ok(),
+        "Fatal error in 'encode_outputs' - {} outputs clipped to {}",
+        outputs.len(),
+        u8::MAX
+    );
     bytes.extend(encode_byte(outputs.len() as u8));
     for output in outputs {
         bytes.extend(encode_note(output));
@@ -665,74 +734,17 @@ fn encode_outputs(outputs: &[Note]) -> Vec<u8> {
 #[must_use]
 pub fn encode_transfer_op(op: &TransferOp) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend(encode_inputs(&op.inputs));
-    bytes.extend(encode_outputs(&op.outputs));
-    bytes
-}
-
-/// Encode operations
-#[must_use]
-pub fn encode_op(op: &Op) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    match op {
-        Op::ChannelInscribe(op) => {
-            bytes.extend(encode_byte(opcode::INSCRIBE));
-            bytes.extend(encode_channel_inscribe(op));
-        }
-        Op::ChannelSetKeys(op) => {
-            bytes.extend(encode_byte(opcode::SET_CHANNEL_KEYS));
-            bytes.extend(encode_channel_set_keys(op));
-        }
-        Op::ChannelDeposit(op) => {
-            bytes.extend(encode_byte(opcode::CHANNEL_DEPOSIT));
-            bytes.extend(encode_channel_deposit(op));
-        }
-        Op::ChannelWithdraw(op) => {
-            bytes.extend(encode_byte(opcode::CHANNEL_WITHDRAW));
-            bytes.extend(encode_channel_withdraw(op));
-        }
-        Op::SDPDeclare(op) => {
-            bytes.extend(encode_byte(opcode::SDP_DECLARE));
-            bytes.extend(encode_sdp_declare(op));
-        }
-        Op::SDPWithdraw(op) => {
-            bytes.extend(encode_byte(opcode::SDP_WITHDRAW));
-            bytes.extend(encode_sdp_withdraw(op));
-        }
-        Op::SDPActive(op) => {
-            bytes.extend(encode_byte(opcode::SDP_ACTIVE));
-            bytes.extend(encode_sdp_active(op));
-        }
-        Op::LeaderClaim(op) => {
-            bytes.extend(encode_byte(opcode::LEADER_CLAIM));
-            bytes.extend(encode_leader_claim(op));
-        }
-        Op::Transfer(op) => {
-            bytes.extend(encode_byte(opcode::TRANSFER));
-            bytes.extend(encode_transfer_op(op));
-        }
-    }
-    bytes
-}
-
-fn encode_ops(ops: &[Op]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend(encode_byte(ops.len() as u8));
-    for op in ops {
-        bytes.extend(encode_op(op));
-    }
+    bytes.extend(encode_inputs(op.inputs.as_ref()));
+    bytes.extend(encode_outputs(op.outputs.as_ref()));
     bytes
 }
 
 /// Encode proofs
 fn encode_op_proof(proof: &OpProof, op: &Op) -> Vec<u8> {
     match (proof, op) {
-        (OpProof::Ed25519Sig(sig), Op::ChannelInscribe(_) | Op::ChannelSetKeys(_)) => {
-            encode_ed25519_signature(sig)
-        }
-        (OpProof::NoProof, Op::ChannelDeposit(_)) => Vec::new(),
-        (OpProof::ChannelWithdrawProof(proof), Op::ChannelWithdraw(_)) => {
-            encode_channel_withdraw_proof(proof)
+        (OpProof::Ed25519Sig(sig), Op::ChannelInscribe(_)) => encode_ed25519_signature(sig),
+        (OpProof::ChannelMultiSigProof(proof), Op::ChannelWithdraw(_) | Op::ChannelConfig(_)) => {
+            encode_channel_multi_sig_proof(proof)
         }
         (
             OpProof::ZkAndEd25519Sigs {
@@ -745,9 +757,10 @@ fn encode_op_proof(proof: &OpProof, op: &Op) -> Vec<u8> {
             bytes.extend(encode_ed25519_signature(ed25519_sig));
             bytes
         }
-        (OpProof::ZkSig(sig), Op::SDPWithdraw(_) | Op::SDPActive(_) | Op::Transfer(_)) => {
-            encode_zk_signature(sig)
-        }
+        (
+            OpProof::ZkSig(sig),
+            Op::SDPWithdraw(_) | Op::SDPActive(_) | Op::Transfer(_) | Op::ChannelDeposit(_),
+        ) => encode_zk_signature(sig),
         (OpProof::PoC(poc), Op::LeaderClaim(_)) => encode_poc(poc),
         _ => {
             panic!("Mismatch between proof type and operation type");
@@ -777,7 +790,7 @@ pub fn encode_mantle_tx(tx: &MantleTx) -> Vec<u8> {
 pub fn encode_signed_mantle_tx(tx: &SignedMantleTx) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend(encode_mantle_tx(&tx.mantle_tx));
-    bytes.extend(encode_ops_proofs(&tx.ops_proofs, &tx.mantle_tx.ops));
+    bytes.extend(encode_ops_proofs(&tx.ops_proofs, tx.mantle_tx.ops()));
     bytes
 }
 
@@ -785,11 +798,22 @@ pub(crate) fn predict_signed_mantle_tx_size(tx: &MantleTx, context: &MantleTxGas
     let mantle_tx_size = encode_mantle_tx(tx).len();
 
     let ops_proofs_size = tx
-        .ops
+        .ops()
         .iter()
         .map(|op| match op {
             // Ed25519SigProof = Ed25519Signature
-            Op::ChannelInscribe(_) | Op::ChannelSetKeys(_) => ED25519_SIG_BYTES,
+            Op::ChannelInscribe(_) => ED25519_SIG_BYTES,
+
+            // ChannelMultiSigProof — for an existing channel, threshold sigs;
+            // for a new channel (just-in-time created here), no sigs required.
+            // TODO: under-predicts if there is a non-empty proof for a new
+            // channel. Tighten before enabling non-zero storage gas prices.
+            Op::ChannelConfig(operation) => {
+                let threshold = context
+                    .configuration_threshold(&operation.channel)
+                    .unwrap_or(0);
+                calculate_channel_multi_sig_proof_byte_size(threshold)
+            }
 
             // ZkAndEd25519SigsProof = ZkSignature Ed25519Signature
             Op::SDPDeclare(_) => GROTH16_BYTES + ED25519_SIG_BYTES,
@@ -799,12 +823,12 @@ pub(crate) fn predict_signed_mantle_tx_size(tx: &MantleTx, context: &MantleTxGas
                 GROTH16_BYTES
             }
 
-            // WithdrawProof
+            // ChannelMultiSigProof
             Op::ChannelWithdraw(operation) => {
                 let channel_withdraw_threshold = context.withdraw_threshold(&operation.channel_id).expect(
                     "Operation should have been verified before reaching this point, so the channel must exist in the context."
                 );
-                calculate_channel_withdraw_proof_byte_size(channel_withdraw_threshold)
+                calculate_channel_multi_sig_proof_byte_size(channel_withdraw_threshold)
             }
 
             // None
@@ -817,15 +841,24 @@ pub(crate) fn predict_signed_mantle_tx_size(tx: &MantleTx, context: &MantleTxGas
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, panic};
 
     use ark_ff::Field as _;
+    use lb_blend_proofs::{quota::VerifiedProofOfQuota, selection::VerifiedProofOfSelection};
     use lb_key_management_system_keys::keys::{Ed25519Key, ZkKey};
+    use lb_utils::bounded_vec::BoundedError;
     use num_bigint::BigUint;
 
     use super::*;
     use crate::{
-        mantle::{Transaction as _, TxHash},
+        mantle::{
+            Transaction as _,
+            ops::channel::{
+                MsgId,
+                inscribe::{self, Inscription, InscriptionOp},
+            },
+            tx::GasPrices,
+        },
         sdp::blend::ActivityProof,
     };
 
@@ -856,29 +889,43 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_primitives() {
+    fn test_encode_decode_primitives() {
         // Test UINT64
-        let data = 42u64.to_le_bytes();
+        let data = encode_uint64(42u64);
         let (remaining, value) = decode_uint64(&data).unwrap();
         assert_eq!(value, 42u64);
         assert!(remaining.is_empty());
 
         // Test UINT32
-        let data = 123u32.to_le_bytes();
+        let data = encode_uint32(123u32);
         let (remaining, value) = decode_uint32(&data).unwrap();
         assert_eq!(value, 123u32);
         assert!(remaining.is_empty());
 
         // Test Byte
-        let data = [0xAB];
+        let data = encode_byte(0xAB);
         let (remaining, value) = decode_byte(&data).unwrap();
         assert_eq!(value, 0xAB);
         assert!(remaining.is_empty());
 
         // Test Hash32
-        let data = [0x42u8; 32];
+        let data = encode_hash32(&[0x42u8; 32]);
         let (remaining, value) = decode_hash32(&data).unwrap();
         assert_eq!(value, [0x42u8; 32]);
+        assert!(remaining.is_empty());
+
+        // Test UTF-8 String
+        let str = "hello, world!".to_owned();
+        let data = encode_string(&str);
+        let (remaining, value) = decode_utf8_string(&data, data.len()).unwrap();
+        assert_eq!(value, str);
+        assert!(remaining.is_empty());
+
+        // Test Unix Timestamp
+        let ts = OffsetDateTime::now_utc();
+        let data = encode_unix_timestamp(&ts);
+        let (remaining, value) = decode_unix_timestamp(&data).unwrap();
+        assert_eq!(value, ts.truncate_to_second());
         assert!(remaining.is_empty());
     }
 
@@ -899,10 +946,7 @@ mod tests {
             clippy::string_add,
             reason = "Recommended String::push_str does not support chaining"
         )]
-        let test_vector = String::new()
-            + "00"                                                               // OpCount=0u8
-            + "6400000000000000"                                                 // ExecutionGasPrice
-            + "3200000000000000"; // StorageGasPrice
+        let test_vector = String::new() + "00"; // OpCount=0u8
 
         // ENCODING
         let encoded = hex::encode(encode_signed_mantle_tx(&signed_tx));
@@ -921,16 +965,14 @@ mod tests {
     #[test]
     fn test_decode_signed_mantle_tx_with_inscribe() {
         let signing_key = Ed25519Key::from_bytes(&[4u8; 32]);
-        let mantle_tx = MantleTx {
-            ops: vec![Op::ChannelInscribe(InscriptionOp {
+        let mantle_tx = MantleTx(Ops::new_unchecked(vec![Op::ChannelInscribe(
+            InscriptionOp {
                 channel_id: ChannelId::from([0xAA; 32]),
-                inscription: b"hello".to_vec(),
+                inscription: b"hello".into(),
                 parent: MsgId::from([0xBB; 32]),
                 signer: signing_key.public_key(),
-            })],
-            execution_gas_price: 100.into(),
-            storage_gas_price: 50.into(),
-        };
+            },
+        )]));
 
         let txhash = mantle_tx.hash();
         let inscribe_sig =
@@ -949,10 +991,8 @@ mod tests {
             + "68656c6c6f"                                                       // Inscription
             + "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" // Parent (32Byte)
             + "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c" // Signer (32Byte)
-            + "6400000000000000"                                                 // ExecutionGasPrice
-            + "3200000000000000"                                                 // StorageGasPrice
-            + "0422c15f3b8c1e5a213d2d41d46b9c6644f7fe0a3d34695d3af450f06b10fdec" // Signature (64Byte)
-            + "ac806ad87e6a73efd5c901dc3af295620615702cbae4de9f46b7e1333284b803";
+            + "4ec789fc67b7f7bfba02f8cc7f3f671a107225faefbe60ca0b8e9e7e8e43e8db" // Signature (64Byte)
+            + "835075aed539fac37e0fdc03acc2aba873e43eef8a835476c4c6bdaaba866901";
 
         // ENCODING
         let encoded = hex::encode(encode_signed_mantle_tx(&signed_tx));
@@ -990,11 +1030,18 @@ mod tests {
         let txhash = mantle_tx.hash();
         let sig = signing_key.sign_payload(&txhash.as_signing_bytes());
 
+        // ChannelConfig creates the channel just-in-time, so no signatures are
+        // required for validation — empty proof is well-formed.
+        let config_proof = ChannelMultiSigProof::new(vec![]).unwrap();
+
         // Encode and decode roundtrip test (no hardcoded test vector since signatures
         // are deterministic)
         let signed_tx = SignedMantleTx::new(
             mantle_tx,
-            vec![OpProof::Ed25519Sig(sig), OpProof::Ed25519Sig(sig)],
+            vec![
+                OpProof::Ed25519Sig(sig),
+                OpProof::ChannelMultiSigProof(config_proof),
+            ],
         )
         .unwrap();
 
@@ -1007,8 +1054,8 @@ mod tests {
     #[tokio::test]
     async fn test_large_payload_encoding_decoding() {
         // Test payload sizes from 512kB up to 2MiB in 512kB increments
-        const CHUNK_SIZE: usize = 512 * 1024;
-        const MAX_SIZE: usize = 2 * 1024 * 1024;
+        const MAX_SIZE: usize = inscribe::MAX_BYTES;
+        const CHUNK_SIZE: usize = MAX_SIZE / 10;
 
         let signing_key = Ed25519Key::from_bytes(&[1; 32]);
 
@@ -1018,7 +1065,7 @@ mod tests {
             let signing_key = signing_key.clone();
 
             let task = tokio::task::spawn(async move {
-                let large_inscription = vec![0xAB; payload_size];
+                let large_inscription = Inscription::new_unchecked(vec![0xAB; payload_size]);
 
                 let inscribe_op = InscriptionOp {
                     channel_id: ChannelId::from([0xAA; 32]),
@@ -1027,11 +1074,8 @@ mod tests {
                     signer: signing_key.public_key(),
                 };
 
-                let mantle_tx = MantleTx {
-                    ops: vec![Op::ChannelInscribe(inscribe_op)],
-                    execution_gas_price: 100.into(),
-                    storage_gas_price: 50.into(),
-                };
+                let mantle_tx =
+                    MantleTx(Ops::new_unchecked(vec![Op::ChannelInscribe(inscribe_op)]));
 
                 let txhash = mantle_tx.hash();
                 let op_sig = signing_key.sign_payload(&txhash.as_signing_bytes());
@@ -1040,7 +1084,8 @@ mod tests {
 
                 let encoded = encode_signed_mantle_tx(&signed_tx);
 
-                let gas_context = MantleTxGasContext::new(HashMap::new());
+                let gas_context =
+                    MantleTxGasContext::new(HashMap::new(), HashMap::new(), GasPrices::new(0, 0));
                 let predicted_size =
                     predict_signed_mantle_tx_size(&signed_tx.mantle_tx, &gas_context);
                 assert_eq!(
@@ -1099,13 +1144,9 @@ mod tests {
         let pk = ZkPublicKey::from(BigUint::from(42u64));
         let note = Note::new(1000, pk);
         let note_id = NoteId(BigUint::from(123u64).into());
-        let transfer_op = TransferOp::new(vec![note_id], vec![note]);
+        let transfer_op = TransferOp::new(Inputs::new(vec![note_id]), Outputs::new(vec![note]));
 
-        let original_tx = MantleTx {
-            ops: vec![Op::Transfer(transfer_op)],
-            execution_gas_price: 100.into(),
-            storage_gas_price: 50.into(),
-        };
+        let original_tx = MantleTx(Ops::new_unchecked(vec![Op::Transfer(transfer_op)]));
 
         // Encode
         let encoded = encode_mantle_tx(&original_tx);
@@ -1149,7 +1190,8 @@ mod tests {
         };
 
         // Predict size
-        let gas_context = MantleTxGasContext::new(HashMap::new());
+        let gas_context =
+            MantleTxGasContext::new(HashMap::new(), HashMap::new(), GasPrices::new(0, 0));
         let predicted_size = predict_signed_mantle_tx_size(&mantle_tx, &gas_context);
 
         // Create a signed tx and encode it to get actual size
@@ -1165,7 +1207,7 @@ mod tests {
         let signing_key = Ed25519Key::from_bytes(&[1; 32]);
         let inscribe_op = InscriptionOp {
             channel_id: ChannelId::from([0xAA; 32]),
-            inscription: b"hello world".to_vec(),
+            inscription: b"hello world".into(),
             parent: MsgId::from([0xBB; 32]),
             signer: signing_key.public_key(),
         };
@@ -1177,7 +1219,8 @@ mod tests {
         };
 
         // Predict size
-        let gas_context = MantleTxGasContext::new(HashMap::new());
+        let gas_context =
+            MantleTxGasContext::new(HashMap::new(), HashMap::new(), GasPrices::new(0, 0));
         let predicted_size = predict_signed_mantle_tx_size(&mantle_tx, &gas_context);
 
         // Create a signed tx and encode it to get actual size
@@ -1196,29 +1239,32 @@ mod tests {
         let signing_key2 = Ed25519Key::from_bytes(&[2; 32]);
         let signing_key3 = Ed25519Key::from_bytes(&[3; 32]);
 
-        let set_keys_op = SetKeysOp {
+        let config_op = ChannelConfigOp {
             channel: ChannelId::from([0xFF; 32]),
             keys: vec![
                 signing_key1.public_key(),
                 signing_key2.public_key(),
                 signing_key3.public_key(),
             ],
+            posting_timeframe: 0.into(),
+            posting_timeout: 0.into(),
+            configuration_threshold: 0,
+            withdraw_threshold: 0,
         };
 
-        let mantle_tx = MantleTx {
-            ops: vec![Op::ChannelSetKeys(set_keys_op)],
-            execution_gas_price: 100.into(),
-            storage_gas_price: 50.into(),
-        };
+        let mantle_tx = MantleTx(Ops::new_unchecked(vec![Op::ChannelConfig(config_op)]));
 
         // Predict size
-        let gas_context = MantleTxGasContext::new(HashMap::new());
+        let gas_context =
+            MantleTxGasContext::new(HashMap::new(), HashMap::new(), GasPrices::new(0, 0));
         let predicted_size = predict_signed_mantle_tx_size(&mantle_tx, &gas_context);
 
-        // Create a signed tx and encode it to get actual size
-        let dummy_ed25519_sig = Ed25519Signature::from_bytes(&[0; 64]);
+        // Create a signed tx and encode it to get actual size. New channel
+        // → empty proof (no signatures required for just-in-time create).
+        let config_proof = ChannelMultiSigProof::new(vec![]).unwrap();
         let signed_tx =
-            SignedMantleTx::new(mantle_tx, vec![OpProof::Ed25519Sig(dummy_ed25519_sig)]).unwrap();
+            SignedMantleTx::new(mantle_tx, vec![OpProof::ChannelMultiSigProof(config_proof)])
+                .unwrap();
         let encoded = encode_signed_mantle_tx(&signed_tx);
         let actual_size = encoded.len();
 
@@ -1231,12 +1277,12 @@ mod tests {
 
         let signing_key = Ed25519Key::from_bytes(&[1; 32]);
         let zk_sk = ZkKey::zero();
-        let locator1: multiaddr::Multiaddr = "/ip4/127.0.0.1/tcp/8080".parse().unwrap();
-        let locator2: multiaddr::Multiaddr = "/ip6/::1/tcp/9090".parse().unwrap();
+        let locator1: Multiaddr = "/ip4/127.0.0.1/tcp/8080".parse().unwrap();
+        let locator2: Multiaddr = "/ip6/::1/tcp/9090".parse().unwrap();
 
         let locked_note_sk = ZkKey::from(BigUint::from(1u64));
         let locked_note = crate::mantle::Utxo {
-            transfer_hash: TxHash::from(BigUint::from(42u64)),
+            op_id: [1u8; 32],
             output_index: 12,
             note: Note {
                 value: 500,
@@ -1245,7 +1291,12 @@ mod tests {
         };
         let sdp_declare_op = SDPDeclareOp {
             service_type: ServiceType::BlendNetwork,
-            locators: vec![Locator::new(locator1), Locator::new(locator2)],
+            locators: vec![
+                Locator::new_unchecked(locator1),
+                Locator::new_unchecked(locator2),
+            ]
+            .try_into()
+            .unwrap(),
             provider_id: ProviderId(signing_key.public_key()),
             zk_id: zk_sk.to_public_key(),
             locked_note_id: locked_note.id(),
@@ -1258,7 +1309,8 @@ mod tests {
         };
 
         // Predict size
-        let gas_context = MantleTxGasContext::new(HashMap::new());
+        let gas_context =
+            MantleTxGasContext::new(HashMap::new(), HashMap::new(), GasPrices::new(0, 0));
         let predicted_size = predict_signed_mantle_tx_size(&mantle_tx, &gas_context);
 
         // Create a signed tx and encode it to get actual size
@@ -1266,7 +1318,7 @@ mod tests {
         let signed_tx = SignedMantleTx::new(
             mantle_tx,
             vec![OpProof::ZkAndEd25519Sigs {
-                zk_sig: ZkKey::multi_sign(&[locked_note_sk, zk_sk], &txhash.0).unwrap(),
+                zk_sig: ZkKey::multi_sign(&[locked_note_sk, zk_sk], &txhash.to_fr()).unwrap(),
                 ed25519_sig: Ed25519Signature::from_bytes(&[0u8; 64]),
             }],
         )
@@ -1287,23 +1339,20 @@ mod tests {
             locked_note_id,
         };
 
-        let mantle_tx = MantleTx {
-            ops: vec![Op::SDPWithdraw(sdp_withdraw_op)],
-            execution_gas_price: 100.into(),
-            storage_gas_price: 50.into(),
-        };
+        let mantle_tx = MantleTx(Ops::new_unchecked(vec![Op::SDPWithdraw(sdp_withdraw_op)]));
 
         let txhash = mantle_tx.hash();
 
         // Predict size
-        let gas_context = MantleTxGasContext::new(HashMap::new());
+        let gas_context =
+            MantleTxGasContext::new(HashMap::new(), HashMap::new(), GasPrices::new(0, 0));
         let predicted_size = predict_signed_mantle_tx_size(&mantle_tx, &gas_context);
 
         // Create a signed tx and encode it to get actual size
         let signed_tx = SignedMantleTx::new(
             mantle_tx,
             vec![OpProof::ZkSig(
-                ZkKey::multi_sign(&[ZkKey::zero()], &txhash.0).unwrap(),
+                ZkKey::multi_sign(&[ZkKey::zero()], &txhash.to_fr()).unwrap(),
             )],
         )
         .unwrap();
@@ -1339,14 +1388,15 @@ mod tests {
             storage_gas_price: 50.into(),
         };
 
-        let gas_context = MantleTxGasContext::new(HashMap::new());
+        let gas_context =
+            MantleTxGasContext::new(HashMap::new(), HashMap::new(), GasPrices::new(0, 0));
         let predicted_size = predict_signed_mantle_tx_size(&mantle_tx, &gas_context);
 
         let txhash = mantle_tx.hash();
         let signed_tx = SignedMantleTx::new(
             mantle_tx,
             vec![OpProof::ZkSig(
-                ZkKey::multi_sign(&[ZkKey::zero()], &txhash.0).unwrap(),
+                ZkKey::multi_sign(&[ZkKey::zero()], &txhash.to_fr()).unwrap(),
             )],
         )
         .unwrap();
@@ -1365,14 +1415,18 @@ mod tests {
 
         let inscribe_op = InscriptionOp {
             channel_id: ChannelId::from([0xAA; 32]),
-            inscription: b"test".to_vec(),
+            inscription: b"test".into(),
             parent: MsgId::from([0xBB; 32]),
             signer: signing_key.public_key(),
         };
 
-        let set_keys_op = SetKeysOp {
+        let config_op = ChannelConfigOp {
             channel: ChannelId::from([0xCC; 32]),
             keys: vec![signing_key.public_key()],
+            posting_timeframe: 0.into(),
+            posting_timeout: 0.into(),
+            configuration_threshold: 0,
+            withdraw_threshold: 0,
         };
 
         let blend_proof = ActivityProof {
@@ -1399,18 +1453,21 @@ mod tests {
         };
 
         // Predict size
-        let gas_context = MantleTxGasContext::new(HashMap::new());
+        let gas_context =
+            MantleTxGasContext::new(HashMap::new(), HashMap::new(), GasPrices::new(0, 0));
         let predicted_size = predict_signed_mantle_tx_size(&mantle_tx, &gas_context);
 
         let txhash = mantle_tx.hash();
         let op_sig = signing_key.sign_payload(&txhash.as_signing_bytes());
-        // Create a signed tx and encode it to get actual size
+        // Create a signed tx and encode it to get actual size. ChannelConfig
+        // creates the channel here, so its proof has no signatures.
+        let config_proof = ChannelMultiSigProof::new(vec![]).unwrap();
         let signed_tx = SignedMantleTx::new(
             mantle_tx,
             vec![
                 OpProof::Ed25519Sig(op_sig),
-                OpProof::Ed25519Sig(op_sig),
-                OpProof::ZkSig(ZkKey::zero().sign_payload(&txhash.0).unwrap()),
+                OpProof::ChannelMultiSigProof(config_proof),
+                OpProof::ZkSig(ZkKey::zero().sign_payload(&txhash.to_fr()).unwrap()),
             ],
         )
         .unwrap();
@@ -1434,16 +1491,16 @@ mod tests {
         let note_id2 = NoteId(BigUint::from(222u64).into());
         let note_id3 = NoteId(BigUint::from(333u64).into());
 
-        let transfer_op = TransferOp::new(vec![note_id1, note_id2, note_id3], vec![note1, note2]);
+        let transfer_op = TransferOp::new(
+            Inputs::new(vec![note_id1, note_id2, note_id3]),
+            Outputs::new(vec![note1, note2]),
+        );
 
-        let mantle_tx = MantleTx {
-            ops: vec![Op::Transfer(transfer_op)],
-            execution_gas_price: 100.into(),
-            storage_gas_price: 50.into(),
-        };
+        let mantle_tx = MantleTx(Ops::new_unchecked(vec![Op::Transfer(transfer_op)]));
 
         // Predict size
-        let gas_context = MantleTxGasContext::new(HashMap::new());
+        let gas_context =
+            MantleTxGasContext::new(HashMap::new(), HashMap::new(), GasPrices::new(0, 0));
         let predicted_size = predict_signed_mantle_tx_size(&mantle_tx, &gas_context);
 
         // Create a signed tx and encode it to get actual size
@@ -1467,30 +1524,38 @@ mod tests {
 
         let inscribe_op = InscriptionOp {
             channel_id: ChannelId::from([0x11; 32]),
-            inscription: b"complex test inscription with more data".to_vec(),
+            inscription: b"complex test inscription with more data".into(),
             parent: MsgId::from([0x22; 32]),
             signer: signing_key1.public_key(),
         };
 
-        let set_keys_op = SetKeysOp {
+        let config_op = ChannelConfigOp {
             channel: ChannelId::from([0x33; 32]),
             keys: vec![signing_key1.public_key(), signing_key2.public_key()],
+            posting_timeframe: 0.into(),
+            posting_timeout: 0.into(),
+            configuration_threshold: 0,
+            withdraw_threshold: 0,
         };
 
         let locked_note_sk = ZkKey::from(BigUint::from(1u64));
         let transfer_op = TransferOp {
-            inputs: vec![NoteId(BigUint::from(777u64).into())],
-            outputs: vec![Note::new(5000, locked_note_sk.to_public_key())],
+            inputs: Inputs::new(vec![NoteId(BigUint::from(777u64).into())]),
+            outputs: Outputs::new(vec![Note::new(5000, locked_note_sk.to_public_key())]),
         };
 
-        let locator: multiaddr::Multiaddr = "/dns4/example.com/tcp/443".parse().unwrap();
+        let locator: Multiaddr = "/dns4/example.com/tcp/443".parse().unwrap();
         let zk_sk = ZkKey::zero();
         let sdp_declare_op = SDPDeclareOp {
             service_type: ServiceType::BlendNetwork,
-            locators: vec![Locator::new(locator)],
+            locators: Locator::new_unchecked(locator).into(),
             provider_id: ProviderId(signing_key1.public_key()),
             zk_id: zk_sk.to_public_key(),
-            locked_note_id: transfer_op.utxo_by_index(0).unwrap().id(),
+            locked_note_id: transfer_op
+                .outputs
+                .utxo_by_index(0, &transfer_op)
+                .unwrap()
+                .id(),
         };
 
         let mantle_tx = MantleTx {
@@ -1505,19 +1570,22 @@ mod tests {
         };
 
         // Predict size
-        let gas_context = MantleTxGasContext::new(HashMap::new());
+        let gas_context =
+            MantleTxGasContext::new(HashMap::new(), HashMap::new(), GasPrices::new(0, 0));
         let predicted_size = predict_signed_mantle_tx_size(&mantle_tx, &gas_context);
 
-        // Create a signed tx and encode it to get actual size
+        // Create a signed tx and encode it to get actual size. ChannelConfig
+        // creates the channel here, so its proof has no signatures.
         let txhash = mantle_tx.hash();
         let op_ed25519_sig = signing_key1.sign_payload(&txhash.as_signing_bytes());
+        let config_proof = ChannelMultiSigProof::new(vec![]).unwrap();
         let signed_tx = SignedMantleTx::new(
             mantle_tx,
             vec![
                 OpProof::Ed25519Sig(op_ed25519_sig),
-                OpProof::Ed25519Sig(op_ed25519_sig),
+                OpProof::ChannelMultiSigProof(config_proof),
                 OpProof::ZkAndEd25519Sigs {
-                    zk_sig: ZkKey::multi_sign(&[locked_note_sk, zk_sk], &txhash.0).unwrap(),
+                    zk_sig: ZkKey::multi_sign(&[locked_note_sk, zk_sk], &txhash.to_fr()).unwrap(),
                     ed25519_sig: op_ed25519_sig,
                 },
                 OpProof::ZkSig(ZkKey::multi_sign(&[], &Fr::ZERO).unwrap()),
@@ -1537,15 +1605,15 @@ mod tests {
         let leader_claim_op = LeaderClaimOp {
             rewards_root: RewardsRoot::default(),
             voucher_nullifier: VoucherNullifier::default(),
+            pk: ZkPublicKey::from(BigUint::from(0u64)),
         };
 
-        let mantle_tx = MantleTx {
-            ops: vec![Op::LeaderClaim(leader_claim_op.clone())],
-            execution_gas_price: 100.into(),
-            storage_gas_price: 50.into(),
-        };
+        let mantle_tx = MantleTx(Ops::new_unchecked(vec![Op::LeaderClaim(
+            leader_claim_op.clone(),
+        )]));
 
-        let empty_gas_context = MantleTxGasContext::new(HashMap::new());
+        let empty_gas_context =
+            MantleTxGasContext::new(HashMap::new(), HashMap::new(), GasPrices::new(0, 0));
         let predicted_size = predict_signed_mantle_tx_size(&mantle_tx, &empty_gas_context);
 
         let poc_proof = Groth16LeaderClaimProof::new(
@@ -1577,6 +1645,7 @@ mod tests {
         let leader_claim_op = LeaderClaimOp {
             rewards_root: RewardsRoot::default(),
             voucher_nullifier: voucher_nf,
+            pk: ZkPublicKey::from(BigUint::from(0u64)),
         };
         let op = Op::LeaderClaim(leader_claim_op);
 
@@ -1605,19 +1674,492 @@ mod tests {
             execution_gas_price: 100.into(),
             storage_gas_price: 50.into(),
         };
+        let op = Op::LeaderClaim(leader_claim_op);
+
+        let encoded = op.encode();
+        let (remaining, decoded_op) = Op::decode(&encoded).unwrap();
+        assert!(remaining.is_empty());
+        assert_eq!(decoded_op, op);
+    }
+
+    #[test]
+    fn test_encode_decode_channel_withdraw_tx() {
+        let pk1 = ZkPublicKey::from(BigUint::from(100u64));
+        let pk2 = ZkPublicKey::from(BigUint::from(200u64));
+
+        let note1 = Note::new(1000, pk1);
+        let note2 = Note::new(2000, pk2);
+
+        let signing_key = Ed25519Key::from_bytes(&[21u8; 32]);
+        let mantle_tx = MantleTx(Ops::new_unchecked(vec![Op::ChannelWithdraw(
+            ChannelWithdrawOp {
+                channel_id: ChannelId::from([0xAB; 32]),
+                outputs: Outputs::new(vec![note1, note2]),
+                withdraw_nonce: 0,
+            },
+        )]));
         let tx_hash = mantle_tx.hash();
-        let proof = ChannelWithdrawProof::new(vec![WithdrawSignature::new(
+        let proof = ChannelMultiSigProof::new(vec![IndexedSignature::new(
             0,
             signing_key.sign_payload(tx_hash.as_signing_bytes().as_ref()),
         )])
         .unwrap();
         let signed_tx =
-            SignedMantleTx::new(mantle_tx, vec![OpProof::ChannelWithdrawProof(proof)]).unwrap();
+            SignedMantleTx::new(mantle_tx, vec![OpProof::ChannelMultiSigProof(proof)]).unwrap();
 
         let encoded = encode_signed_mantle_tx(&signed_tx);
         let (remaining, decoded_tx) = decode_signed_mantle_tx(&encoded).unwrap();
 
         assert!(remaining.is_empty());
         assert_eq!(decoded_tx, signed_tx);
+    }
+
+    // ==============================================================================
+    // Security Tests - Memory Over-Allocation Protection
+    // ==============================================================================
+
+    #[test]
+    fn test_encode_reject_oversized_inscription() {
+        let oversized_inscription = vec![0xAB; inscribe::MAX_BYTES + 1];
+
+        let result = Inscription::try_from(oversized_inscription);
+        assert_eq!(
+            result,
+            Err(BoundedError::TooLong {
+                actual: inscribe::MAX_BYTES + 1,
+                max: inscribe::MAX_BYTES
+            })
+        );
+    }
+
+    #[test]
+    fn test_decode_reject_oversized_inscription() {
+        // Create a malicious input with inscription_len = MAX_INSCRIPTION_SIZE + 1
+        let mut malicious_input = Vec::new();
+
+        // ChannelId (32 bytes)
+        malicious_input.extend_from_slice(&[0x42; 32]);
+
+        // Inscription length (u32) - exceeds MAX_INSCRIPTION_SIZE
+        let oversized_len = inscribe::MAX_BYTES + 1;
+        malicious_input.extend_from_slice(&oversized_len.to_le_bytes());
+
+        // We don't need to include the actual inscription data because
+        // the decoder should reject it before trying to read that much
+
+        // Try to decode - should fail with TooLarge error
+        let result = InscriptionOp::decode(&malicious_input);
+        assert!(result.is_err(), "Should reject oversized inscription");
+
+        // Verify it fails with the right error kind
+        match result {
+            Err(nom::Err::Error(e)) => {
+                assert_eq!(e.code, ErrorKind::TooLarge);
+            }
+            _ => panic!("Expected TooLarge error"),
+        }
+    }
+
+    #[test]
+    fn test_decode_reject_oversized_metadata() {
+        // Create a malicious input with metadata_len = MAX_METADATA_SIZE + 1
+        let mut malicious_input = Vec::new();
+
+        // DeclarationId (32 bytes)
+        malicious_input.extend_from_slice(&[0x42; 32]);
+
+        // Nonce (u64)
+        malicious_input.extend_from_slice(&42u64.to_le_bytes());
+
+        // Metadata length (u32) - exceeds MAX_METADATA_SIZE
+        let oversized_len = MAX_ENCODE_DECODE_METADATA_SIZE + 1;
+        malicious_input.extend_from_slice(&oversized_len.to_le_bytes());
+
+        // Try to decode - should fail with TooLarge error
+        let result = decode_sdp_active(&malicious_input);
+        assert!(result.is_err(), "Should reject oversized metadata");
+
+        // Verify it fails with the right error kind
+        match result {
+            Err(nom::Err::Error(e)) => {
+                assert_eq!(e.code, ErrorKind::TooLarge);
+            }
+            _ => panic!("Expected TooLarge error"),
+        }
+    }
+
+    #[test]
+    fn test_encode_reject_excessive_op_count() {
+        let ops = vec![
+            Op::ChannelConfig(ChannelConfigOp {
+                channel: ChannelId::from([0x22; 32]),
+                keys: vec![Ed25519Key::from_bytes(&[1; 32]).public_key()],
+                posting_timeframe: 0.into(),
+                posting_timeout: 0.into(),
+                configuration_threshold: 0,
+                withdraw_threshold: 0,
+            });
+            u8::MAX as usize + 1
+        ];
+
+        let result = Ops::try_from(ops);
+        assert_eq!(
+            result,
+            Err(BoundedError::TooLong {
+                actual: u8::MAX as usize + 1,
+                max: u8::MAX as usize
+            })
+        );
+    }
+
+    #[test]
+    fn test_decode_accept_max_op_count() {
+        // Test that op_count = MAX_OP_COUNT is accepted
+        // (though it will fail later due to missing op data, which is fine for this
+        // test)
+        let valid_input = vec![u8::MAX];
+
+        // Should not fail with TooLarge error (will fail with incomplete data)
+        let result = NomOps::decode(&valid_input);
+        if let Err(nom::Err::Error(e)) = result {
+            assert_ne!(e.code, ErrorKind::TooLarge, "Should not reject at u8::MAX]");
+        }
+    }
+
+    #[test]
+    fn test_decode_accept_max_inscription_size() {
+        // Test that we can decode an inscription at exactly MAX_INSCRIPTION_SIZE
+        let mut valid_input = Vec::new();
+
+        // ChannelId (32 bytes)
+        valid_input.extend_from_slice(&[0x42; 32]);
+
+        // Inscription length (u32) - exactly MAX_INSCRIPTION_SIZE
+        valid_input.extend_from_slice(&(inscribe::MAX_BYTES as u32).to_le_bytes());
+
+        // Inscription data (MAX_INSCRIPTION_SIZE bytes)
+        valid_input.extend_from_slice(&vec![0x01; inscribe::MAX_BYTES]);
+
+        // Parent MsgId (32 bytes)
+        valid_input.extend_from_slice(&[0x43; 32]);
+
+        // Signer Ed25519PublicKey (32 bytes)
+        let sk = Ed25519Key::from_bytes(&[0x44; 32]);
+        let pk = sk.public_key();
+        valid_input.extend_from_slice(&pk.to_bytes());
+
+        // Should succeed (though signature validation might fail later)
+        let result = InscriptionOp::decode(&valid_input);
+        assert!(
+            result.is_ok(),
+            "Should accept inscription at MAX_INSCRIPTION_SIZE: {result:?}",
+        );
+
+        let (_, inscription_op) = result.unwrap();
+        assert_eq!(inscription_op.inscription.len(), inscribe::MAX_BYTES);
+    }
+
+    #[test]
+    fn test_decode_memory_safety_no_allocation_on_oversized_length() {
+        // This test verifies that we reject oversized lengths WITHOUT
+        // attempting to allocate the memory first
+
+        // Test with an astronomically large inscription_len
+        // (e.g., 4GB which would cause the original bug)
+        let huge_len = u32::MAX; // 4GB - 1
+
+        let mut malicious_input = Vec::new();
+        malicious_input.extend_from_slice(&[0x42; 32]); // ChannelId
+        malicious_input.extend_from_slice(&huge_len.to_le_bytes());
+
+        // This should fail immediately without trying to allocate 4GB
+        let result = InscriptionOp::decode(&malicious_input);
+        assert!(result.is_err(), "Should reject huge inscription length");
+
+        // Similar test for metadata
+        let mut malicious_input2 = Vec::new();
+        malicious_input2.extend_from_slice(&[0x42; 32]); // DeclarationId
+        malicious_input2.extend_from_slice(&42u64.to_le_bytes()); // Nonce
+        malicious_input2.extend_from_slice(&huge_len.to_le_bytes());
+
+        let result2 = decode_sdp_active(&malicious_input2);
+        assert!(result2.is_err(), "Should reject huge metadata length");
+    }
+
+    #[test]
+    fn test_encode_reject_excessive_key_count() {
+        let config_op = ChannelConfigOp {
+            channel: ChannelId::from([0x22; 32]),
+            keys: vec![Ed25519Key::from_bytes(&[1; 32]).public_key(); u8::MAX as usize + 1],
+            posting_timeframe: 0.into(),
+            posting_timeout: 0.into(),
+            configuration_threshold: 0,
+            withdraw_threshold: 0,
+        };
+
+        // Should panic
+        let result = panic::catch_unwind(|| encode_channel_config(&config_op));
+        assert!(result.is_err(), "Should reject excessive output count");
+    }
+
+    #[test]
+    fn test_decode_accept_max_key_count() {
+        // Test that key_count = MAX_KEY_COUNT is accepted
+        let mut valid_input = Vec::new();
+
+        // ChannelId (32 bytes)
+        valid_input.extend_from_slice(&[0x42; 32]);
+
+        // KeyCount = MAX_KEY_COUNT
+        valid_input.push(u8::MAX);
+
+        // Add MAX_KEY_COUNT Ed25519 public keys (each 32 bytes)
+        for i in 0..u8::MAX {
+            let sk = Ed25519Key::from_bytes(&[i; 32]);
+            let pk = sk.public_key();
+            valid_input.extend_from_slice(&pk.to_bytes());
+        }
+
+        // Posting Timeframe (32 bytes)
+        valid_input.extend_from_slice(&[0; 32]);
+
+        // Posting Timeout (32 bytes)
+        valid_input.extend_from_slice(&[0; 32]);
+
+        // Configuration Threshold (16 bytes)
+        valid_input.extend_from_slice(&[0; 16]);
+
+        // Withdraw Threshold (16 bytes)
+        valid_input.extend_from_slice(&[0; 16]);
+
+        let result = decode_channel_config(&valid_input);
+        assert!(result.is_ok(), "Should accept max key count: {result:?}");
+
+        let (_, set_keys_op) = result.unwrap();
+        assert_eq!(set_keys_op.keys.len(), u8::MAX as usize);
+    }
+
+    #[test]
+    fn test_encode_reject_excessive_sdp_declare() {
+        let locator: Multiaddr = "/dns4/example.com/tcp/443".parse().unwrap();
+        let sdp_declare_op = SDPDeclareOp {
+            service_type: ServiceType::BlendNetwork,
+            locators: vec![Locator::new_unchecked(locator); u8::MAX as usize + 1]
+                .try_into()
+                .unwrap(), /* excessive locator count */
+            provider_id: ProviderId(Ed25519Key::from_bytes(&[1; 32]).public_key()),
+            zk_id: ZkKey::zero().to_public_key(),
+            locked_note_id: NoteId(BigUint::from(111u64).into()),
+        };
+
+        // Should panic
+        let result = panic::catch_unwind(|| {
+            encode_sdp_declare(&sdp_declare_op);
+        });
+        assert!(result.is_err(), "Should reject excessive output count");
+    }
+
+    #[test]
+    fn test_encode_reject_excessive_sdp_active() {
+        let blend_proof = ActivityProof {
+            session: u64::MAX,
+            signing_key: Ed25519Key::from_bytes(&[1; 32]).public_key(),
+            proof_of_quota: VerifiedProofOfQuota::from_bytes_unchecked([0u8; 160]).into(),
+            proof_of_selection: VerifiedProofOfSelection::from_bytes_unchecked([0u8; 32]).into(),
+        };
+        let sdp_active_op = SDPActiveOp {
+            declaration_id: DeclarationId([0x33; 32]),
+            nonce: u64::MAX,
+            metadata: ActivityMetadata::Blend(Box::new(blend_proof)),
+        };
+        assert_eq!(
+            sdp_active_op.metadata.to_metadata_bytes().len(),
+            MAX_ENCODE_DECODE_METADATA_SIZE as usize,
+            "`ActiveMessage` has a fixed size of 234 bytes"
+        );
+    }
+
+    #[test]
+    fn test_encode_reject_excessive_input_count() {
+        let note_id = NoteId(BigUint::from(111u64).into());
+        let inputs = [note_id; u8::MAX as usize + 1];
+
+        // Should panic
+        let result = panic::catch_unwind(|| {
+            encode_inputs(&inputs);
+        });
+        assert!(result.is_err(), "Should reject excessive output count");
+    }
+
+    #[test]
+    fn test_encode_reject_excessive_output_count() {
+        let note = Note::new(1000, ZkPublicKey::from(BigUint::from(42u64)));
+        let outputs = [note; u8::MAX as usize + 1];
+
+        // Should panic
+        let result = panic::catch_unwind(|| {
+            encode_outputs(&outputs);
+        });
+        assert!(result.is_err(), "Should reject excessive output count");
+    }
+
+    #[test]
+    fn test_decode_reject_oversized_locator() {
+        // Create a malicious input with oversized locator
+        let mut malicious_input = Vec::new();
+
+        // ServiceType (1 byte)
+        malicious_input.push(0x00);
+
+        // LocatorCount (1 byte) - just 1 locator
+        malicious_input.push(1);
+
+        let oversized_len = (LOCATOR_BYTES_SIZE_LIMIT + 1) as u16;
+        malicious_input.extend_from_slice(&oversized_len.to_le_bytes());
+
+        // Add the oversized data
+        malicious_input.extend_from_slice(&vec![0x01; LOCATOR_BYTES_SIZE_LIMIT + 1]);
+
+        // ... rest of SDPDeclare fields ...
+
+        let result = decode_sdp_declare(&malicious_input);
+        if let Err(nom::Err::Error(ref e)) = result {
+            assert_eq!(
+                e.code,
+                ErrorKind::LengthValue,
+                "Should reject at `LOCATOR_BYTES_SIZE_LIMIT + 1`"
+            );
+        } else {
+            panic!("Should reject oversized locator");
+        }
+    }
+
+    #[test]
+    fn test_decode_accept_max_locator_size() {
+        // Create a malicious input with oversized locator
+        let mut malicious_input = Vec::new();
+
+        // ServiceType (1 byte)
+        malicious_input.push(0x00);
+
+        // LocatorCount (1 byte) - just 1 locator
+        malicious_input.push(1);
+
+        let oversized_len = (LOCATOR_BYTES_SIZE_LIMIT) as u16;
+        malicious_input.extend_from_slice(&oversized_len.to_le_bytes());
+
+        // Add the oversized data
+        malicious_input.extend_from_slice(&vec![0x01; LOCATOR_BYTES_SIZE_LIMIT]);
+
+        // ... rest of SDPDeclare fields ...
+
+        let result = decode_sdp_declare(&malicious_input);
+        if let Err(nom::Err::Error(ref e)) = result {
+            assert_ne!(
+                e.code,
+                ErrorKind::LengthValue,
+                "Should not reject at `LOCATOR_BYTES_SIZE_LIMIT`"
+            );
+        }
+        assert!(result.is_err(), "Should reject invalid declaration");
+    }
+
+    #[test]
+    fn decode_reject_invalid_locator() {
+        let invalid_locator: Multiaddr = "/ip4/0.0.0.0/udp/3000/quic-v1"
+            .parse()
+            .expect("locator should parse as multiaddr");
+        let op = SDPDeclareOp {
+            service_type: ServiceType::BlendNetwork,
+            locators: Locator::new_unchecked(invalid_locator).into(),
+            provider_id: ProviderId(Ed25519Key::from_bytes(&[1; 32]).public_key()),
+            zk_id: ZkKey::zero().to_public_key(),
+            locked_note_id: NoteId(BigUint::from(111u64).into()),
+        };
+
+        let encoded = encode_sdp_declare(&op);
+        let result = decode_sdp_declare(&encoded);
+
+        match result {
+            Err(nom::Err::Error(e)) => assert_eq!(e.code, ErrorKind::Fail),
+            _ => panic!("Expected Verify error for invalid locator"),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_max_inputs() {
+        let note_id = NoteId(BigUint::from(111u64).into());
+        let inputs = [note_id; u8::MAX as usize];
+
+        // Encode should succeed
+        let encoded = encode_inputs(&inputs);
+        assert!(
+            !encoded.is_empty(),
+            "Encoding max input count should produce some output"
+        );
+
+        // Decode should succeed and produce the same number of inputs
+        let result = decode_inputs(&encoded);
+        assert!(result.is_ok(), "Should decode max input count");
+        let (_, decoded_inputs) = result.unwrap();
+        assert_eq!(
+            decoded_inputs.len(),
+            u8::MAX as usize,
+            "Decoded input count should match max"
+        );
+    }
+
+    #[test]
+    fn test_encode_decode_max_outputs() {
+        let note = Note::new(1000, ZkPublicKey::from(BigUint::from(42u64)));
+        let outputs = [note; u8::MAX as usize];
+
+        // Encode should succeed
+        let encoded = encode_outputs(&outputs);
+        assert!(
+            !encoded.is_empty(),
+            "Encoding max output count should produce some output"
+        );
+
+        // Decode should succeed and produce the same number of outputs
+        let result = decode_outputs(&encoded);
+        assert!(result.is_ok(), "Should decode max output count");
+        let (_, decoded_outputs) = result.unwrap();
+        assert_eq!(
+            decoded_outputs.len(),
+            u8::MAX as usize,
+            "Decoded output count should match max"
+        );
+    }
+
+    #[test]
+    fn test_accept_max_input_output_counts() {
+        // Test that input_count = MAX_INPUT_COUNT works
+        let mut valid_input = Vec::new();
+        valid_input.push(u8::MAX);
+
+        // Add MAX_INPUT_COUNT field elements (each 32 bytes)
+        for _ in 0..u8::MAX {
+            valid_input.extend_from_slice(&[0x01; 32]);
+        }
+
+        let result = decode_inputs(&valid_input);
+        assert!(result.is_ok(), "Should accept max input count");
+        let (_, inputs) = result.unwrap();
+        assert_eq!(inputs.len(), u8::MAX as usize);
+
+        // Test that output_count = MAX_OUTPUT_COUNT works
+        let mut valid_output = u8::MAX.to_le_bytes().to_vec();
+
+        // Add MAX_OUTPUT_COUNT notes (each: 8 bytes value + 32 bytes key)
+        for _ in 0..u8::MAX {
+            valid_output.extend_from_slice(&42u64.to_le_bytes()); // value
+            valid_output.extend_from_slice(&[0x02; 32]); // public key
+        }
+
+        let result = decode_outputs(&valid_output);
+        assert!(result.is_ok(), "Should accept max output count");
+        let (_, outputs) = result.unwrap();
+        assert_eq!(outputs.len(), u8::MAX as usize);
     }
 }

@@ -1,7 +1,6 @@
 use std::{collections::HashSet, time::SystemTime};
 
-use lb_core::header::{Header, HeaderId};
-use lb_groth16::{Field as _, Fr};
+use lb_core::{header::HeaderId, mantle::GenesisTx as _};
 use lb_ledger::LedgerState;
 use overwatch::{DynError, services::state::ServiceState};
 use serde::{Deserialize, Serialize};
@@ -68,13 +67,18 @@ impl ServiceState for CryptarchiaConsensusState {
         settings: &<Self as ServiceState>::Settings,
     ) -> Result<Self, <Self as ServiceState>::Error> {
         let (lib_id, genesis_id, lib_ledger_state) = match &settings.starting_state {
-            StartingState::Genesis { genesis_tx } => {
-                let lib_id = Header::genesis(genesis_tx).id();
-                let ledger = LedgerState::from_genesis_tx(
-                    genesis_tx.clone(),
+            StartingState::Genesis { genesis_block } => {
+                let lib_id = genesis_block.header().id();
+                let genesis_tx = genesis_block
+                    .transactions()
+                    .next()
+                    .expect("Genesis block should be valid");
+                let (ledger, _events) = LedgerState::from_genesis_tx(
+                    genesis_tx,
                     &settings.config,
-                    Fr::ZERO, // TODO: recover from genesis tx
+                    genesis_tx.cryptarchia_parameter().epoch_nonce,
                 )?;
+                // TODO: store genesis block and events to DB: https://github.com/logos-blockchain/logos-blockchain/issues/2747
                 (lib_id, lib_id, ledger)
             }
             StartingState::Lib {

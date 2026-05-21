@@ -2,8 +2,7 @@ use core::num::{NonZero, NonZeroU32};
 use std::collections::HashMap;
 
 use lb_core::{
-    block::BlockNumber,
-    mantle::genesis_tx::GenesisTx,
+    block::{BlockNumber, genesis::GenesisBlock},
     sdp::{MinStake, ServiceType},
 };
 use lb_cryptarchia_engine::{
@@ -21,14 +20,14 @@ pub struct Settings {
     pub learning_rate: NonNegativeF64,
     pub sdp_config: SdpConfig,
     pub gossipsub_protocol: String,
-    pub genesis_state: GenesisTx,
+    pub genesis_block: GenesisBlock,
     #[serde(default)]
     pub faucet_pk: Option<ZkPublicKey>,
 }
 
 impl Settings {
     #[must_use]
-    pub const fn slots_per_epoch(&self) -> u64 {
+    pub fn slots_per_epoch(&self) -> u64 {
         epoch_length(
             self.epoch_config.epoch_stake_distribution_stabilization,
             self.epoch_config.epoch_period_nonce_buffer,
