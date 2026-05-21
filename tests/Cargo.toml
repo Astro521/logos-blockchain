@@ -1,9 +1,24 @@
 [package]
-edition = "2021"
-license = { workspace = true }
-name    = "tests"
-publish = false
-version = "0.1.0"
+categories  = { workspace = true }
+description = { workspace = true }
+edition     = { workspace = true }
+keywords    = { workspace = true }
+license     = { workspace = true }
+name        = "logos-blockchain-tests"
+publish     = false
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+divan       = { workspace = true }
+lb-core     = { workspace = true }
+lb-groth16  = { workspace = true }
+lb-mmr      = { workspace = true }
+lb-utxotree = { workspace = true }
 
 [dependencies]
 blst                     = { version = "0.3.11" }
@@ -51,17 +66,84 @@ tracing                  = { workspace = true }
 x25519-dalek             = { version = "2", features = ["getrandom", "static_secrets"] }
 
 [[test]]
-name = "test_cryptarchia_happy_path"
-path = "src/tests/cryptarchia/happy.rs"
+name = "blend_devnet_setup"
+path = "src/tests/blend/devnet.rs"
 
 [[test]]
-name = "test_da"
-path = "src/tests/da/disperse.rs"
+name = "test_cli_restart"
+path = "src/tests/cli/restart.rs"
 
 [[test]]
+<<<<<<< HEAD
 name = "test_da_api"
 path = "src/tests/da/api.rs"
 
 [[test]]
 name = "test_mempool_api"
 path = "src/tests/mempool/api.rs"
+=======
+name = "test_cryptarchia_blocks_streaming"
+path = "src/tests/cryptarchia/blocks_streaming.rs"
+
+[[test]]
+name = "test_mantle_chain_start"
+path = "src/tests/mantle/chain_start.rs"
+
+[[test]]
+name = "test_mantle_channel"
+path = "src/tests/mantle/channel.rs"
+
+[[test]]
+name              = "test_mantle_sdp_ops"
+path              = "src/tests/mantle/sdp/ops.rs"
+required-features = ["mantle_sdp"]
+
+[[test]]
+name              = "test_mantle_sdp_blend"
+path              = "src/tests/mantle/sdp/activity.rs"
+required-features = ["mantle_sdp"]
+
+[[test]]
+name = "test_mantle_leader"
+path = "src/tests/mantle/leader.rs"
+
+[[test]]
+name              = "test_testing_framework_smoke_local"
+path              = "src/tests/testing_framework/smoke_local.rs"
+required-features = ["testing_framework"]
+
+[[test]]
+name              = "test_testing_framework_external_urls_inscription"
+path              = "src/tests/testing_framework/external_urls_inscription.rs"
+required-features = ["testing_framework"]
+
+[[test]]
+name              = "test_testing_framework_fork_detector"
+path              = "src/tests/testing_framework/fork_detector.rs"
+required-features = ["testing_framework"]
+
+[[test]]
+name              = "test_testing_framework_k8s_smoke"
+path              = "src/tests/testing_framework/k8s_smoke.rs"
+required-features = ["testing_framework"]
+
+[[test]]
+name              = "test_testing_framework_cucumber_smoke_local"
+path              = "cucumber_tests/stand_alone_tests/cucumber_smoke_local.rs"
+required-features = ["cucumber_stand_alone"]
+
+[[test]]
+name              = "test_testing_framework_cucumber_smoke_k8s"
+path              = "cucumber_tests/stand_alone_tests/cucumber_smoke_k8s.rs"
+required-features = ["cucumber_stand_alone"]
+
+[[test]]
+harness           = false                        # Cucumber will have its own main() function to run tests.
+name              = "cucumber"
+path              = "cucumber_tests/cucumber.rs"
+required-features = ["cucumber"]
+
+[[bench]]
+harness = false
+name    = "voucher"
+>>>>>>> b632cc7d2f9ec8a6969ff51c559545aa4e001ac7

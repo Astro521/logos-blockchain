@@ -1,19 +1,41 @@
-pub const CL_METRICS: &str = "/cl/metrics";
-pub const CL_STATUS: &str = "/cl/status";
+pub const MANTLE_METRICS: &str = "/mantle/metrics";
+pub const MANTLE_STATUS: &str = "/mantle/status";
+pub const MANTLE_SDP_DECLARATIONS: &str = "/mantle/sdp/declarations";
 pub const CRYPTARCHIA_INFO: &str = "/cryptarchia/info";
 pub const CRYPTARCHIA_HEADERS: &str = "/cryptarchia/headers";
-pub const DA_ADD_SHARE: &str = "/da/add-share";
-pub const DA_GET_RANGE: &str = "/da/get-range";
-pub const DA_GET_SHARES_COMMITMENTS: &str = "/da/get-commitments";
-pub const DA_GET_LIGHT_SHARE: &str = "/da/get-share";
-pub const DA_GET_SHARES: &str = "/da/sampling/shares";
-pub const DA_BLOCK_PEER: &str = "/da/block-peer";
-pub const DA_UNBLOCK_PEER: &str = "/da/unblock-peer";
-pub const DA_BLACKLISTED_PEERS: &str = "/da/blacklisted-peers";
-pub const DA_BALANCER_STATS: &str = "/da/balancer-stats";
-pub const DA_MONITOR_STATS: &str = "/da/monitor-stats";
+pub const CRYPTARCHIA_LIB_STREAM: &str = "/cryptarchia/lib-stream";
 pub const NETWORK_INFO: &str = "/network/info";
-pub const STORAGE_BLOCK: &str = "/storage/block";
+pub const BLEND_NETWORK_INFO: &str = "/blend/info";
 pub const MEMPOOL_ADD_TX: &str = "/mempool/add/tx";
-pub const MEMPOOL_ADD_BLOB_INFO: &str = "/mempool/add/blobinfo";
-pub const DISPERSE_DATA: &str = "/disperse-data";
+pub const CHANNEL: &str = "/channel/:id";
+pub const CHANNEL_DEPOSIT: &str = "/channel/deposit";
+pub const SDP_POST_DECLARATION: &str = "/sdp/declaration";
+pub const SDP_POST_ACTIVITY: &str = "/sdp/activity";
+pub const SDP_POST_WITHDRAWAL: &str = "/sdp/withdrawal";
+pub const SDP_POST_SET_DECLARATION_ID: &str = "/sdp/set-declaration-id";
+pub const LEADER_CLAIM: &str = "/leader/claim";
+
+// TODO: change prefix to `/chain` since `Block` is defined outside of
+// Cryptarchia
+pub const BLOCKS: &str = "/cryptarchia/blocks";
+pub const BLOCKS_RANGE_STREAM: &str = "/cryptarchia/blocks_range";
+pub const BLOCKS_DETAIL: &str = "/cryptarchia/blocks/:id";
+pub const BLOCK_EVENTS: &str = "/cryptarchia/blocks/:id/events";
+pub const BLOCKS_STREAM: &str = "/cryptarchia/events/blocks/stream";
+
+pub const TRANSACTION: &str = "/cryptarchia/transaction/:id";
+
+pub mod wallet {
+    pub const BALANCE: &str = "/wallet/:public_key/balance";
+    pub const TRANSACTIONS_TRANSFER_FUNDS: &str = "/wallet/transactions/transfer-funds";
+    pub const SIGN_TX_ED25519: &str = "/wallet/sign/ed25519";
+    pub const SIGN_TX_ZK: &str = "/wallet/sign/zk";
+}
+
+pub mod admin {
+    pub const TRACING_FILTER: &str = "/admin/tracing/filter";
+}
+
+// testing paths
+pub const UPDATE_MEMBERSHIP: &str = "/test/membership/update";
+pub const DIAL_PEER: &str = "/test/network/dial_peer";

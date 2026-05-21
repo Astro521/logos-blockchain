@@ -1,30 +1,43 @@
+# syntax=docker/dockerfile:1
+# check=skip=SecretsUsedInArgOrEnv
+# Ignore warnings about sensitive information as this is test data.
+
+ARG LB_CIRCUITS_VERSION=v0.4.2
+ARG LB_NODE_VERSION=0.1.3
+
 # ===========================
 # BUILD IMAGE
 # ===========================
 
-FROM rust:1.87.0-slim-bookworm AS builder
+FROM alpine:latest AS builder
 
-LABEL maintainer="augustinas@status.im" \
-    source="https://github.com/logos-co/nomos-node" \
-    description="Nomos node image"
+ARG LB_CIRCUITS_VERSION
+ARG LB_NODE_VERSION
 
-WORKDIR /nomos
+WORKDIR /logos-blockchain
 COPY . .
 
-# Install dependencies needed for building RocksDB, etc.
-RUN apt-get update && apt-get install -yq \
-    git gcc g++ clang libssl-dev pkg-config ca-certificates
+RUN apk add --no-cache curl bash
+RUN scripts/setup-logos-blockchain-circuits.sh "$LB_CIRCUITS_VERSION" "/opt/circuits"
+RUN scripts/setup-logos-blockchain-node.sh "$LB_NODE_VERSION" "linux-$(uname -m)"
 
-RUN cargo install cargo-binstall --locked
-RUN cargo install rzup --version 0.4.1 --locked
-RUN rzup install cargo-risczero 2.0.0
-RUN rzup install rust 1.85.0
+# ===========================
+# NODE IMAGE
+# ===========================
 
-RUN cargo build --release -p nomos-node
+FROM debian:trixie-slim
 
-RUN cp /nomos/target/release/nomos-node /usr/bin/nomos-node
+ARG LB_CIRCUITS_VERSION
 
-# Expose default ports
+LABEL maintainer="augustinas@status.im" \
+    source="https://github.com/logos-blockchain/logos-blockchain" \
+    description="Logos blockchain node image"
+
+COPY --from=builder /opt/circuits /opt/circuits
+COPY --from=builder /usr/local/bin/logos-blockchain-node /usr/local/bin/logos-blockchain-node
+
+ENV LOGOS_BLOCKCHAIN_CIRCUITS=/opt/circuits
+
 EXPOSE 3000 8080 9000 60000
 
-ENTRYPOINT ["/usr/bin/nomos-node"]
+ENTRYPOINT ["logos-blockchain-node"]

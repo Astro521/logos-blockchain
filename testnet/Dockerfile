@@ -1,32 +1,72 @@
-# BUILD IMAGE ---------------------------------------------------------
+# syntax=docker/dockerfile:1
+# check=skip=SecretsUsedInArgOrEnv
+# Ignore warnings about sensitive information as this is test data.
 
-FROM rust:1.87.0-slim-bookworm AS builder
+ARG VERSION=v0.4.2
 
-LABEL maintainer="augustinas@status.im" \
-    source="https://github.com/logos-co/nomos-node" \
-    description="Nomos testnet image"
+# ===========================
+# BUILD IMAGE
+# ===========================
+FROM rust:1.95.0-slim-bookworm AS builder
 
-WORKDIR /nomos
+ARG VERSION
+
+WORKDIR /logos-blockchain
 COPY . .
 
-# Install dependencies needed for building RocksDB and etcd.
+# Install dependencies needed for building RocksDB.
 RUN apt-get update && apt-get install -yq \
-    git gcc g++ clang libssl-dev pkg-config ca-certificates
+    build-essential git clang libssl-dev pkg-config ca-certificates curl unzip
 
-RUN cargo install cargo-binstall --locked
-RUN cargo install rzup --version 0.4.1 --locked
-RUN rzup install cargo-risczero 2.0.0
-RUN rzup install rust 1.85.0
+# Install Bun for L2 demo frontend.
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:$PATH"
 
-RUN cargo build --release
+# Build Frontend Webapp
+WORKDIR /logos-blockchain/testnet/l2-sequencer-archival-demo/webapp
+RUN bun install --frozen-lockfile
+RUN VITE_SEQUENCER_URL=/api/sequencer VITE_ARCHIVER_URL=/api/archiver bun run build
 
-RUN cp /nomos/target/release/nomos-node /usr/bin/nomos-node && \
-    cp /nomos/target/release/nomos-executor /usr/bin/nomos-executor && \
-    cp /nomos/target/release/nomos-cli /usr/bin/nomos-cli && \
-    cp /nomos/target/release/cfgsync-server /usr/bin/cfgsync-server && \
-    cp /nomos/target/release/cfgsync-client /usr/bin/cfgsync-client
+# Build Rust Binaries & Circuits
+WORKDIR /logos-blockchain
+ENV LOGOS_BLOCKCHAIN_CIRCUITS=/opt/circuits
+RUN scripts/setup-logos-blockchain-circuits.sh "$VERSION" "$LOGOS_BLOCKCHAIN_CIRCUITS"
+RUN cargo build --locked --release
 
-# nomos default ports
-EXPOSE 3000 8080 9000 60000
+# ===========================
+# NODE IMAGE
+# ===========================
+FROM debian:bookworm-slim
 
-ENTRYPOINT ["/usr/bin/nomos-node"]
+ARG VERSION
+
+LABEL maintainer="augustinas@status.im" \
+    source="https://github.com/logos-blockchain/logos-blockchain" \
+    description="Logos Blockchain node and other binaries image"
+
+RUN apt-get update && apt-get install -yq \
+    libstdc++6 libssl3 ca-certificates \
+    python3 python3-pip curl git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy Circuits
+COPY --from=builder /opt/circuits /opt/circuits
+ENV LOGOS_BLOCKCHAIN_CIRCUITS=/opt/circuits
+
+# Copy Binaries
+COPY --from=builder /logos-blockchain/target/release/logos-blockchain-node /usr/bin/
+COPY --from=builder /logos-blockchain/target/release/logos-blockchain-cfgsync-server /usr/bin/
+COPY --from=builder /logos-blockchain/target/release/logos-blockchain-cfgsync-client /usr/bin/
+COPY --from=builder /logos-blockchain/target/release/logos-blockchain-demo-sequencer /usr/bin/
+COPY --from=builder /logos-blockchain/target/release/logos-blockchain-demo-archiver /usr/bin/
+COPY --from=builder /logos-blockchain/target/release/logos-blockchain-faucet /usr/bin/
+
+# Copy Frontend & Nginx config
+COPY --from=builder /logos-blockchain/testnet/l2-sequencer-archival-demo/webapp/dist /var/www/l2-demo
+COPY --from=builder /logos-blockchain/testnet/l2-sequencer-archival-demo/nginx/nginx.conf /etc/nginx/nginx.conf
+
+# Copy Scripts
+COPY --from=builder /logos-blockchain/testnet/scripts /opt/scripts
+
+EXPOSE 80 3000 8000 8080 8090 9000 18080 60000
+ENTRYPOINT ["/usr/bin/logos-blockchain-node"]

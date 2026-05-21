@@ -1,0 +1,36 @@
+[package]
+categories  = { workspace = true }
+description = { workspace = true }
+edition     = { workspace = true }
+keywords    = { workspace = true }
+license     = { workspace = true }
+name        = "logos-blockchain-services-utils"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[package.metadata.cargo-machete]
+# False positives.
+ignored = [
+  # Required by Overwatch's `#[derive_services]` macro.
+  "tracing",
+]
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+futures     = { workspace = true }
+log         = { workspace = true }
+overwatch   = { features = ["derive"], workspace = true }
+serde       = { workspace = true }
+serde_json  = { features = ["alloc"], workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+
+[dev-dependencies]
+overwatch-derive = { workspace = true }
+serde            = { features = ["derive"], workspace = true }
+tokio            = { workspace = true }
+tracing          = { workspace = true }

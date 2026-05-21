@@ -1,0 +1,38 @@
+[package]
+categories  = { workspace = true }
+description = { workspace = true }
+edition     = { workspace = true }
+keywords    = { workspace = true }
+license     = { workspace = true }
+name        = "logos-blockchain-blend-message"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+blake2                        = { workspace = true }
+derivative                    = { workspace = true }
+hex                           = { workspace = true }
+itertools                     = { workspace = true }
+lb-blend-crypto               = { workspace = true }
+lb-blend-proofs               = { workspace = true }
+lb-core                       = { workspace = true }
+lb-groth16                    = { workspace = true }
+lb-key-management-system-keys = { workspace = true }
+lb-log-targets                = { workspace = true }
+lb-utils                      = { features = ["rng"], workspace = true }
+serde                         = { workspace = true }
+serde-big-array               = { workspace = true }
+serde_with                    = { features = ["alloc"], workspace = true }
+thiserror                     = { workspace = true }
+tracing                       = { workspace = true }
+zeroize                       = { workspace = true }
+
+[dev-dependencies]
+test-log = { features = ["trace"], workspace = true }
+
+[features]
+unsafe-test-functions = []

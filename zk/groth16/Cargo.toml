@@ -1,0 +1,29 @@
+[package]
+categories  = { workspace = true }
+description = { workspace = true }
+edition     = { workspace = true }
+keywords    = { workspace = true }
+license     = { workspace = true }
+name        = "logos-blockchain-groth16"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+ark-bn254     = { features = ["curve"], workspace = true }
+ark-ec        = { workspace = true }
+ark-ff        = { workspace = true }
+ark-groth16   = { features = ["std"], workspace = true }
+ark-serialize = { workspace = true }
+generic-array = { features = ["serde"], workspace = true }
+hex           = { features = ["alloc"], workspace = true }
+num-bigint    = { workspace = true }
+serde         = { features = ["derive"], workspace = true }
+serde_json    = { features = ["alloc"], workspace = true }
+thiserror     = { workspace = true }
+
+[dev-dependencies]
+bincode = { workspace = true }
+
+[lints]
+workspace = true
