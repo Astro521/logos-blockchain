@@ -78,7 +78,7 @@ impl Settings {
         self.rounds_per_interval(slots_per_block, slot_duration)
     }
 
-    /// Number of rounds per epoch transition period.
+    /// Number of rounds per session transition period.
     ///
     /// The Blend spec defines this as roughly the same time it takes to propose
     /// a new block.
@@ -107,7 +107,7 @@ impl Settings {
             activity_threshold_sensitivity: self.core.activity_threshold_sensitivity,
             data_replication_factor: self.common.data_replication_factor,
             message_frequency_per_round: self.core.scheduler.cover.message_frequency_per_round,
-            minimum_network_size: self.common.minimum_network_size.into(),
+            minimum_network_size: self.common.minimum_network_size,
             num_blend_layers: self.common.num_blend_layers,
             rounds_per_session: self.rounds_per_session(
                 cryptarchia_deployment.slots_per_epoch(),
@@ -122,7 +122,7 @@ pub struct CommonSettings {
     /// `ß_c`: expected number of blending operations for each locally generated
     /// message.
     pub num_blend_layers: NonZeroU64,
-    pub minimum_network_size: MinimumNetworkSize,
+    pub minimum_network_size: NonZeroU64,
     pub protocol_name: StreamProtocol,
     pub data_replication_factor: u64,
 }

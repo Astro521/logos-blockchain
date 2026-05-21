@@ -179,7 +179,7 @@ pub struct EpochConfig {
 
 impl EpochConfig {
     #[must_use]
-    pub const fn epoch_length(&self, base_period_length: NonZero<u64>) -> u64 {
+    pub fn epoch_length(&self, base_period_length: NonZero<u64>) -> u64 {
         epoch_length(
             self.epoch_stake_distribution_stabilization,
             self.epoch_period_nonce_buffer,
@@ -202,20 +202,26 @@ impl EpochConfig {
 }
 
 #[must_use]
-pub const fn epoch_length(
+pub fn epoch_length(
     epoch_stake_distribution_stabilization: NonZero<u8>,
     epoch_period_nonce_buffer: NonZero<u8>,
     epoch_period_nonce_stabilization: NonZero<u8>,
     base_period_length: NonZero<u64>,
 ) -> u64 {
-    ((epoch_stake_distribution_stabilization.get() as u64)
-        .saturating_add(epoch_period_nonce_buffer.get() as u64)
-        .saturating_add(epoch_period_nonce_stabilization.get() as u64))
+    [
+        u64::from(NonZeroU64::from(epoch_stake_distribution_stabilization)),
+        u64::from(NonZeroU64::from(epoch_period_nonce_buffer)),
+        u64::from(NonZeroU64::from(epoch_period_nonce_stabilization)),
+    ]
+    .into_iter()
+    .reduce(u64::saturating_add)
+    .unwrap_or(0)
     .saturating_mul(base_period_length.get())
 }
 
-#[serde_with::serde_as]
-#[derive(Copy, Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "serde", cfg_eval::cfg_eval, serde_with::serde_as)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Copy, Clone, Debug)]
 pub struct SlotConfig {
     #[serde_as(as = "MinimalBoundedDuration<1, SECOND>")]
     pub slot_duration: Duration,
