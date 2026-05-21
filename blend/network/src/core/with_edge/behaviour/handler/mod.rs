@@ -5,6 +5,7 @@ use core::{
 };
 use std::io;
 
+use lb_log_targets::blend;
 use libp2p::{
     StreamProtocol,
     core::upgrade::{DeniedUpgrade, ReadyUpgrade},
@@ -21,7 +22,7 @@ mod ready_to_receive;
 mod receiving;
 mod starting;
 
-const LOG_TARGET: &str = "blend::network::core::handler::core-edge";
+const LOG_TARGET: &str = blend::network::core::handler::CORE_EDGE;
 
 type TimerFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 type MessageReceiveFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>, io::Error>> + Send>>;
@@ -146,6 +147,15 @@ impl libp2p::swarm::ConnectionHandler for ConnectionHandler {
     #[expect(deprecated, reason = "Self::InboundOpenInfo is deprecated")]
     fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
         SubstreamProtocol::new(ReadyUpgrade::new(self.protocol_name.clone()), ())
+    }
+
+    // We need this override because the Swarm is configured with a keepalive
+    // timeout of `0`, which causes connections with edge nodes to be dropped before
+    // there is even an active stream. So we manage the keepalive state ourselves,
+    // by marking the connection as stale if the connection handler is dropped for
+    // any reason.
+    fn connection_keep_alive(&self) -> bool {
+        !matches!(self.state, Some(ConnectionState::Dropped(_)))
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {

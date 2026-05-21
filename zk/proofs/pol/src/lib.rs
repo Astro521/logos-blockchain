@@ -38,30 +38,19 @@ use std::error::Error;
 
 pub use chain_inputs::{PolChainInputs, PolChainInputsData};
 pub use inputs::{PolVerifierInput, PolWitnessInputs, PolWitnessInputsData};
-use lb_groth16::{
-    CompressedGroth16Proof, Groth16Input, Groth16InputDeser, Groth16Proof, Groth16ProofJsonDeser,
-};
-use thiserror::Error;
+use lb_groth16::{CompressedGroth16Proof, Groth16Proof, Groth16ProofJsonDeser};
 use tracing::error;
-pub use wallet_inputs::{PolWalletInputs, PolWalletInputsData};
+pub use wallet_inputs::{
+    AGED_NOTE_MERKLE_TREE_HEIGHT, LATEST_NOTE_MERKLE_TREE_HEIGHT, PolWalletInputs,
+    PolWalletInputsData,
+};
 pub use witness::Witness;
 
 pub use crate::lottery::{LotteryConstants, P};
 use crate::{inputs::PolVerifierInputJson, proving_key::POL_PROVING_KEY_PATH};
 
 pub type PoLProof = CompressedGroth16Proof;
-
-#[derive(Debug, Error)]
-pub enum ProveError {
-    #[error(transparent)]
-    Io(std::io::Error),
-    #[error(transparent)]
-    Json(serde_json::Error),
-    #[error("Error parsing Groth16 input: {0:?}")]
-    Groth16JsonInput(<Groth16Input as TryFrom<Groth16InputDeser>>::Error),
-    #[error(transparent)]
-    Groth16JsonProof(<Groth16Proof as TryFrom<Groth16ProofJsonDeser>>::Error),
-}
+pub type ProveError = lbp_error::Error;
 
 ///
 /// This function generates a proof for the given set of inputs.
@@ -83,13 +72,11 @@ pub enum ProveError {
 /// - Returns a `ProveError::Json` if there is an error during JSON
 ///   serialization or deserialization.
 pub fn prove(inputs: &PolWitnessInputs) -> Result<(PoLProof, PolVerifierInput), ProveError> {
-    let witness = witness::generate_witness(inputs).map_err(ProveError::Io)?;
+    let witness = witness::generate_witness(inputs)?;
     let (proof, verifier_inputs) =
-        lb_circuits_prover::prover_from_contents(POL_PROVING_KEY_PATH.as_path(), witness.as_ref())
-            .map_err(ProveError::Io)?;
-    let proof: Groth16ProofJsonDeser = serde_json::from_slice(&proof).map_err(ProveError::Json)?;
-    let verifier_inputs: PolVerifierInputJson =
-        serde_json::from_slice(&verifier_inputs).map_err(ProveError::Json)?;
+        lb_circuits_prover::prover_from_contents(POL_PROVING_KEY_PATH.as_path(), witness.as_ref())?;
+    let proof: Groth16ProofJsonDeser = serde_json::from_slice(&proof)?;
+    let verifier_inputs: PolVerifierInputJson = serde_json::from_slice(&verifier_inputs)?;
     let proof: Groth16Proof = proof.try_into().map_err(ProveError::Groth16JsonProof)?;
     Ok((
         CompressedGroth16Proof::try_from(&proof).unwrap_or_else(|e| {
@@ -217,20 +204,12 @@ mod tests {
                 "20716527055704913432992003250600357730017309147012913323969779133930909800072",
                 "14787709838677865776105327831675542255717739581860994014618609782788824576885",
             ]
-            .into_iter()
-            .map(|value| BigUint::from_str(value).unwrap().into())
-            .collect(),
-            aged_selector: [
-                "0", "1", "1", "0", "1", "1", "0", "1", "0", "0", "1", "0", "1", "0", "0", "1",
-                "0", "1", "1", "1", "1", "0", "1", "1", "1", "0", "0", "0", "0", "1", "1", "1",
-            ]
-            .into_iter()
-            .map(|s| match s {
-                "1" => true,
-                "0" => false,
-                _ => panic!("Invalid value for aged_selector"),
-            })
-            .collect(),
+            .map(|value| BigUint::from_str(value).unwrap().into()),
+            aged_selectors: [
+                false, true, true, false, true, true, false, true, false, false, true, false, true,
+                false, false, true, false, true, true, true, true, false, true, true, true, false,
+                false, false, false, true, true, true,
+            ],
             latest_path: [
                 "11709948088963960065647371537879293701565786386460016885512089239291870378840",
                 "2120901090324525908662474041962168618570906102338290469215218624292046179330",
@@ -265,20 +244,12 @@ mod tests {
                 "18200637942483578342976888834386216643273358976477818116888783794758722873887",
                 "15874955117141602197688150287249257989589905293755369275305245316881887378284",
             ]
-            .into_iter()
-            .map(|value| BigUint::from_str(value).unwrap().into())
-            .collect(),
-            latest_selector: [
-                "0", "1", "0", "0", "1", "1", "0", "0", "0", "0", "1", "0", "0", "1", "1", "1",
-                "1", "1", "1", "0", "0", "1", "0", "1", "0", "0", "1", "1", "1", "1", "1", "0",
-            ]
-            .into_iter()
-            .map(|s| match s {
-                "1" => true,
-                "0" => false,
-                _ => panic!("Invalid value for aged_selector"),
-            })
-            .collect(),
+            .map(|value| BigUint::from_str(value).unwrap().into()),
+            latest_selectors: [
+                false, true, false, false, true, true, false, false, false, false, true, false,
+                false, true, true, true, true, true, true, false, false, true, false, true, false,
+                false, true, true, true, true, true, false,
+            ],
             secret_key: BigUint::from_str(
                 "7897218687652577456193628084912129251352759708723100638805247670738317482408",
             )

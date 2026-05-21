@@ -1,21 +1,32 @@
 use std::{
-    num::{NonZero, NonZeroU64},
-    ops::Add,
+    num::NonZero,
+    ops::{Add, Sub},
     time::Duration,
 };
 
-#[cfg(feature = "serde")]
 use lb_utils::bounded_duration::{MinimalBoundedDuration, SECOND};
 use time::OffsetDateTime;
 #[cfg(feature = "tokio")]
 use tokio::time::{Interval, MissedTickBehavior};
 
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Debug, Default, Eq, PartialEq, Copy, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    Copy,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Slot(u64);
 
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Debug, Eq, PartialEq, Copy, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, Copy, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct Epoch(u32);
 
 impl Epoch {
@@ -67,7 +78,7 @@ impl Slot {
         slot_config: SlotConfig,
     ) -> Self {
         // TODO: leap seconds / weird time stuff
-        let since_start = offset_date_time - slot_config.chain_start_time;
+        let since_start = offset_date_time - slot_config.genesis_time;
         if since_start.is_negative() {
             // current slot is behind the start time, so return default 0
             Self::genesis()
@@ -85,6 +96,22 @@ impl Slot {
     #[must_use]
     pub const fn saturating_sub(self, rhs: Self) -> Self {
         Self(self.0.saturating_sub(rhs.0))
+    }
+}
+
+impl Add for Slot {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self(self.0 + rhs.0)
+    }
+}
+
+impl Sub for Slot {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        self.saturating_sub(rhs)
     }
 }
 
@@ -136,8 +163,7 @@ impl Add<u32> for Epoch {
     }
 }
 
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EpochConfig {
     // The stake distribution is always taken at the beginning of the previous epoch.
     // This parameters controls how many slots to wait for it to be stabilized
@@ -197,10 +223,10 @@ pub fn epoch_length(
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Copy, Clone, Debug)]
 pub struct SlotConfig {
-    #[cfg_attr(feature = "serde", serde_as(as = "MinimalBoundedDuration<1, SECOND>"))]
+    #[serde_as(as = "MinimalBoundedDuration<1, SECOND>")]
     pub slot_duration: Duration,
     /// Start of the first epoch
-    pub chain_start_time: OffsetDateTime,
+    pub genesis_time: OffsetDateTime,
 }
 
 #[cfg(feature = "tokio")]
@@ -225,8 +251,8 @@ impl SlotTimer {
     #[must_use]
     pub fn slot_interval(&self, now: OffsetDateTime) -> Interval {
         let slot_duration = self.config.slot_duration;
-        let next_slot_start = self.config.chain_start_time
-            + slot_duration * u64::from(self.current_slot(now) + 1) as u32;
+        let next_slot_start =
+            self.config.genesis_time + slot_duration * u64::from(self.current_slot(now) + 1) as u32;
         let delay = next_slot_start - now;
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now()

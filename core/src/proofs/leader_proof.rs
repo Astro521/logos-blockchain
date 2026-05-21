@@ -8,6 +8,7 @@ use lb_poseidon2::{Digest as _, Poseidon2Bn254Hasher};
 use lb_utxotree::MerklePath;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::error;
 
 use crate::{
     mantle::{
@@ -114,7 +115,10 @@ impl LeaderProof for Groth16LeaderProof {
                 leader_pk,
             ),
         )
-        .is_ok()
+        .unwrap_or_else(|e| {
+            error!("LeaderProof verification failed: {e:?}");
+            false
+        })
     }
 
     fn verify_genesis(&self) -> bool {
@@ -238,12 +242,20 @@ impl LeaderPrivate {
         let (latest_path, latest_selector) = merkle_path_to_witness(latest_path);
         let wallet = lb_pol::PolWalletInputsData {
             note_value: note.note.value,
-            transaction_hash: *note.tx_hash.as_ref(),
+            transaction_hash: Fr::from_le_bytes_mod_order(note.op_id.as_ref()),
             output_number: note.output_index as u64,
-            aged_path,
-            aged_selector,
-            latest_path,
-            latest_selector,
+            aged_path: aged_path
+                .try_into()
+                .expect("Aged path length should match the expected height"),
+            aged_selectors: aged_selector
+                .try_into()
+                .expect("Aged selector length should match the expected height"),
+            latest_path: latest_path
+                .try_into()
+                .expect("Latest path length should match the expected height"),
+            latest_selectors: latest_selector
+                .try_into()
+                .expect("Latest selector length should match the expected height"),
             secret_key,
         };
         let input = lb_pol::PolWitnessInputsData::from_chain_and_wallet_data(chain, wallet);
@@ -272,17 +284,30 @@ mod proof_serde {
     where
         S: Serializer,
     {
-        serializer.serialize_bytes(&item.to_bytes())
+        let bytes = item.to_bytes();
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&hex::encode(bytes))
+        } else {
+            serializer.serialize_bytes(&bytes)
+        }
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<lb_pol::PoLProof, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let proof_bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
-        let proof_array: [u8; 128] = proof_bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("Expected exactly 128 bytes"))?;
+        let proof_array: [u8; 128] = if deserializer.is_human_readable() {
+            let s = String::deserialize(deserializer)?;
+            hex::decode(s)
+                .map_err(serde::de::Error::custom)?
+                .try_into()
+                .map_err(|_| serde::de::Error::custom("Expected exactly 128 bytes"))?
+        } else {
+            let proof_bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+            proof_bytes
+                .try_into()
+                .map_err(|_| serde::de::Error::custom("Expected exactly 128 bytes"))?
+        };
         Ok(lb_pol::PoLProof::from_bytes(&proof_array))
     }
 }

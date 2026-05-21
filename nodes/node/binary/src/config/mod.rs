@@ -3,15 +3,25 @@ use std::{
     io::Read,
     net::{IpAddr, SocketAddr, ToSocketAddrs as _},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
-use ::tracing::{Level, warn};
-use clap::{Parser, Subcommand, ValueEnum, builder::OsStr};
+use ::tracing::warn;
+use clap::{Parser, ValueEnum, builder::OsStr};
 use color_eyre::eyre::{Result, eyre};
+use lb_core::sdp::ProviderId;
+use lb_key_management_system_service::keys::{Key, ZkPublicKey};
 use lb_libp2p::{Multiaddr, ed25519::SecretKey};
-use serde::Deserialize;
+use lb_tracing::{
+    filter::envfilter::{default_envfilter_config, parse_filter_directives},
+    logging::local::{AppenderType, CompressionType, RetentionType, RollingConfig, RotationType},
+};
+use serde::{Deserialize, Serialize};
 
-use crate::config::tracing::serde::logger::{FileConfig, GelfConfig};
+use crate::config::tracing::serde::{
+    filter::{EnvConfig, Layer},
+    logger::{FileConfig, GelfConfig},
+};
 pub use crate::config::{
     api::serde::Config as ApiConfig,
     blend::serde::Config as BlendConfig,
@@ -44,110 +54,76 @@ pub mod wallet;
 #[cfg(test)]
 mod tests;
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None,
-          args_conflicts_with_subcommands = true,
-          subcommand_negates_reqs = true)]
-pub struct CliArgs {
-    #[command(subcommand)]
-    pub command: Option<Command>,
-
-    /// Path for a yaml-encoded network config file
-    config: Option<PathBuf>,
-    /// Dry-run flag. If active, the binary will try to deserialize the config
-    /// file and then exit.
-    #[clap(long = "check-config", action)]
-    check_config_only: bool,
-    /// Overrides log config.
-    #[clap(flatten)]
-    log: LogArgs,
-    /// Overrides network config.
-    #[clap(flatten)]
-    network: NetworkArgs,
-    /// Overrides blend config.
-    #[clap(flatten)]
-    blend: BlendArgs,
-    /// Overrides http config.
-    #[clap(flatten)]
-    api: ApiArgs,
-    #[clap(flatten)]
-    deployment: DeploymentArgs,
-    #[clap(flatten)]
-    state: StateArgs,
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct UserConfig {
+    #[serde(default)]
+    pub network: NetworkConfig,
+    pub blend: BlendConfig,
+    pub cryptarchia: CryptarchiaConfig,
+    #[serde(default)]
+    pub time: TimeConfig,
+    pub sdp: SdpConfig,
+    #[serde(default)]
+    pub api: ApiConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub kms: KmsConfig,
+    pub wallet: WalletConfig,
+    #[serde(default)]
+    pub tracing: TracingConfig,
+    #[serde(default)]
+    pub state: StateConfig,
 }
 
-#[derive(Subcommand, Debug)]
-pub enum Command {
-    /// Initialize a new user config with generated keys
-    #[cfg(feature = "config-gen")]
-    Init(InitArgs),
-    /// Publish text inscriptions as zone blocks
-    Inscribe(logos_blockchain_tui_zone::InscribeArgs),
+pub struct RequiredValues {
+    pub blend: BlendConfig,
+    pub cryptarchia: CryptarchiaConfig,
+    pub sdp: SdpConfig,
+    pub wallet: WalletConfig,
 }
 
-#[cfg(feature = "config-gen")]
-#[derive(Parser, Debug)]
-pub struct InitArgs {
-    /// Trusted peers to bootstrap from (multiaddr format)
-    #[clap(long = "initial-peers", short = 'p', num_args = 1.., value_delimiter = ',')]
-    pub initial_peers: Vec<Multiaddr>,
-
-    /// Output file path for the generated config
-    #[clap(long = "output", short = 'o', default_value = "user_config.yaml")]
-    pub output: PathBuf,
-
-    /// Network listen port
-    #[clap(long = "net-port", default_value = "3000")]
-    pub net_port: u16,
-
-    /// Blend listen port
-    #[clap(long = "blend-port", default_value = "3400")]
-    pub blend_port: u16,
-
-    /// HTTP API listen address
-    #[clap(long = "http-addr", default_value = "0.0.0.0:8080")]
-    pub http_addr: SocketAddr,
-
-    /// External address for nodes with a known public IP (disables NAT
-    /// traversal). Format: /ip4/<public-ip>/udp/<port>/quic-v1
-    #[clap(long = "external-address")]
-    pub external_address: Option<Multiaddr>,
-
-    /// Skip automatic public IP detection
-    #[clap(long = "no-public-ip-check")]
-    pub no_public_ip_check: bool,
-
-    /// Deployment configuration (well-known name or path to custom config)
-    #[clap(long = "deployment", default_value = DeploymentType::default())]
-    pub deployment: DeploymentType,
-
-    #[clap(long = "state-path")]
-    pub state_path: Option<PathBuf>,
-}
-
-#[cfg(feature = "config-gen")]
-impl Default for InitArgs {
-    fn default() -> Self {
-        Self::parse_from::<Vec<String>, String>(vec![])
-    }
-}
-
-impl CliArgs {
+impl UserConfig {
     #[must_use]
-    pub fn config_path(&self) -> &Path {
-        self.config
-            .as_deref()
-            .expect("config path is required when not using a subcommand")
+    pub fn with_required_values(required_values: RequiredValues) -> Self {
+        Self {
+            blend: required_values.blend,
+            cryptarchia: required_values.cryptarchia,
+            sdp: required_values.sdp,
+            wallet: required_values.wallet,
+
+            api: ApiConfig::default(),
+            kms: KmsConfig::default(),
+            network: NetworkConfig::default(),
+            state: StateConfig::default(),
+            storage: StorageConfig::default(),
+            time: TimeConfig::default(),
+            tracing: TracingConfig::default(),
+        }
     }
 
-    #[must_use]
-    pub const fn dry_run(&self) -> bool {
-        self.check_config_only
+    pub fn blend_provider_id(&self) -> Result<ProviderId, String> {
+        let key_id = &self.blend.non_ephemeral_signing_key_id;
+        let Some(key) = self.kms.backend.keys.get(key_id) else {
+            return Err(format!(
+                "Blend non-ephemeral signing key '{key_id}' not found in KMS"
+            ));
+        };
+        let Key::Ed25519(secret_key) = key else {
+            return Err("Blend non-ephemeral signing key must be Ed25519".to_owned());
+        };
+        Ok(ProviderId(secret_key.public_key()))
     }
 
-    #[must_use]
-    pub const fn deployment_type(&self) -> &DeploymentType {
-        &self.deployment.deployment_type
+    pub fn blend_zk_key(&self) -> Result<(String, ZkPublicKey), String> {
+        let key_id = &self.blend.core.zk.secret_key_kms_id;
+        let Some(key) = self.kms.backend.keys.get(key_id) else {
+            return Err(format!("Blend ZK signing key '{key_id}' not found in KMS"));
+        };
+        let Key::Zk(secret_key) = key else {
+            return Err("Blend ZK signing key must be Zk".to_owned());
+        };
+        Ok((key_id.to_owned(), secret_key.to_public_key()))
     }
 }
 
@@ -167,6 +143,26 @@ impl From<LoggerLayerType> for OsStr {
             LoggerLayerType::File => "File".into(),
             LoggerLayerType::Stderr => "Stderr".into(),
             LoggerLayerType::Stdout => "Stdout".into(),
+        }
+    }
+}
+
+#[derive(ValueEnum, Clone, Debug, Default)]
+pub enum LogFileAppenderType {
+    #[default]
+    Simple,
+    Rolling,
+    RollingCompressed,
+    RollingMaxFiles,
+}
+
+impl From<LogFileAppenderType> for OsStr {
+    fn from(value: LogFileAppenderType) -> Self {
+        match value {
+            LogFileAppenderType::Simple => "Simple".into(),
+            LogFileAppenderType::Rolling => "Rolling".into(),
+            LogFileAppenderType::RollingCompressed => "RollingCompressed".into(),
+            LogFileAppenderType::RollingMaxFiles => "RollingMaxFiles".into(),
         }
     }
 }
@@ -203,6 +199,21 @@ pub struct LogArgs {
 
     #[clap(long = "log-level", env = "LOG_LEVEL")]
     level: Option<String>,
+
+    /// Per-target log filter directives, e.g.
+    /// `libp2p_gossipsub=info,h2=warn`
+    #[clap(long = "log-filter", env = "LOG_FILTER")]
+    filter: Option<String>,
+
+    #[clap(long = "log-file-appender", env = "LOG_APPENDER")]
+    file_appender: Option<LogFileAppenderType>,
+
+    #[clap(
+        long = "log-max-files",
+        env = "LOG_APPENDER_MAX_FILES",
+        required_if_eq("file_appender", LogFileAppenderType::RollingMaxFiles)
+    )]
+    max_files: Option<usize>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -301,91 +312,6 @@ impl FromStr for DeploymentType {
     }
 }
 
-#[derive(Deserialize, Debug, Clone)]
-#[cfg_attr(
-    any(feature = "testing", feature = "config-gen"),
-    derive(serde::Serialize)
-)]
-pub struct UserConfig {
-    #[serde(default)]
-    pub network: NetworkConfig,
-    pub blend: BlendConfig,
-    pub cryptarchia: CryptarchiaConfig,
-    #[serde(default)]
-    pub time: TimeConfig,
-    pub sdp: SdpConfig,
-    #[serde(default)]
-    pub api: ApiConfig,
-    #[serde(default)]
-    pub storage: StorageConfig,
-    #[serde(default)]
-    pub kms: KmsConfig,
-    pub wallet: WalletConfig,
-    #[serde(default)]
-    pub tracing: TracingConfig,
-    #[serde(default)]
-    pub state: StateConfig,
-}
-
-pub struct RequiredValues {
-    pub blend: BlendConfig,
-    pub cryptarchia: CryptarchiaConfig,
-    pub sdp: SdpConfig,
-    pub wallet: WalletConfig,
-}
-
-impl UserConfig {
-    pub fn update_from_args(mut self, args: CliArgs) -> Result<RunConfig> {
-        let CliArgs {
-            log: log_args,
-            api: api_args,
-            network: network_args,
-            blend: blend_args,
-            deployment: deployment_args,
-            state: state_args,
-            ..
-        } = args;
-        update_tracing(&mut self.tracing, log_args)?;
-        update_network(&mut self.network, network_args)?;
-        update_blend(&mut self.blend, blend_args);
-        update_api(&mut self.api, api_args);
-        update_state(&mut self.state, state_args);
-
-        let deployment_settings = match deployment_args.deployment_type() {
-            DeploymentType::WellKnown(well_known_deployment) => (*well_known_deployment).into(),
-            DeploymentType::Custom(custom_deployment_config_path) => {
-                deserialize_config_at_path::<DeploymentSettings>(
-                    custom_deployment_config_path,
-                    OnUnknownKeys::Warn,
-                )?
-            }
-        };
-
-        Ok(RunConfig {
-            deployment: deployment_settings,
-            user: self,
-        })
-    }
-
-    #[must_use]
-    pub fn with_required_values(required_values: RequiredValues) -> Self {
-        Self {
-            blend: required_values.blend,
-            cryptarchia: required_values.cryptarchia,
-            sdp: required_values.sdp,
-            wallet: required_values.wallet,
-
-            api: ApiConfig::default(),
-            kms: KmsConfig::default(),
-            network: NetworkConfig::default(),
-            state: StateConfig::default(),
-            storage: StorageConfig::default(),
-            time: TimeConfig::default(),
-            tracing: TracingConfig::default(),
-        }
-    }
-}
-
 pub fn update_tracing(tracing: &mut TracingConfig, tracing_args: LogArgs) -> Result<()> {
     let LogArgs {
         backend,
@@ -393,6 +319,9 @@ pub fn update_tracing(tracing: &mut TracingConfig, tracing_args: LogArgs) -> Res
         directory,
         prefix,
         level,
+        filter,
+        file_appender,
+        max_files,
     } = tracing_args;
 
     if let Some(backend_type) = backend {
@@ -407,10 +336,37 @@ pub fn update_tracing(tracing: &mut TracingConfig, tracing_args: LogArgs) -> Res
                 });
             }
             LoggerLayerType::File => {
+                let appender_type = match file_appender {
+                    Some(LogFileAppenderType::Simple) | None => AppenderType::Simple,
+                    Some(LogFileAppenderType::Rolling) => AppenderType::Rolling(RollingConfig {
+                        rotation: RotationType::Hourly,
+                        retention: RetentionType::None,
+                        compression: CompressionType::None,
+                    }),
+                    Some(LogFileAppenderType::RollingCompressed) => {
+                        AppenderType::Rolling(RollingConfig {
+                            rotation: RotationType::Hourly,
+                            retention: RetentionType::None,
+                            compression: CompressionType::Gzip {
+                                compression_threshold: Duration::from_hours(2),
+                            },
+                        })
+                    }
+                    Some(LogFileAppenderType::RollingMaxFiles) => {
+                        AppenderType::Rolling(RollingConfig {
+                            rotation: RotationType::Hourly,
+                            retention: RetentionType::MaxFiles {
+                                max_files: max_files.expect("Max files should be set"),
+                            },
+                            compression: CompressionType::None,
+                        })
+                    }
+                };
                 tracing.logger.file = Some(FileConfig {
                     directory: directory
                         .ok_or_else(|| eyre!("File backend requires a directory."))?,
                     prefix,
+                    appender_type,
                 });
             }
             LoggerLayerType::Stdout => {
@@ -422,17 +378,68 @@ pub fn update_tracing(tracing: &mut TracingConfig, tracing_args: LogArgs) -> Res
         }
     }
 
-    if let Some(level_str) = level {
-        tracing.level = match level_str.to_uppercase().as_str() {
-            "TRACE" => Level::TRACE,
-            "DEBUG" => Level::DEBUG,
-            "INFO" => Level::INFO,
-            "ERROR" => Level::ERROR,
-            "WARN" => Level::WARN,
-            _ => return Err(eyre!("Invalid log level provided: {}", level_str)),
-        };
-    }
+    update_tracing_level_and_filter(tracing, level.as_deref(), filter.as_deref())?;
+
     Ok(())
+}
+
+pub fn update_tracing_level_and_filter(
+    tracing: &mut TracingConfig,
+    level: Option<&str>,
+    filter: Option<&str>,
+) -> Result<()> {
+    if let Some(level) = level {
+        tracing.level = level
+            .parse()
+            .map_err(|_| eyre!("Invalid log level provided: {level}"))?;
+    }
+
+    if let Some(filter) = filter {
+        tracing.filter = parse_log_filter_layer(filter)?;
+    } else {
+        apply_default_debug_log_filter(tracing);
+    }
+
+    Ok(())
+}
+
+pub fn update_tracing_filter_and_derive_level(
+    tracing: &mut TracingConfig,
+    filter: &str,
+) -> Result<()> {
+    let layer = parse_log_filter_layer(filter)?;
+    let Layer::Env(EnvConfig { ref filters }) = layer else {
+        unreachable!("parse_log_filter_layer always returns an env filter");
+    };
+
+    if let Some(level) = filters.values().copied().max() {
+        tracing.level = level;
+    }
+
+    tracing.filter = layer;
+
+    Ok(())
+}
+
+/// Parses CLI/env filter overrides into the typed filter config form.
+fn parse_log_filter_layer(raw: &str) -> Result<Layer> {
+    let filters = parse_filter_directives(raw).map_err(|error| eyre!(error))?;
+
+    Ok(Layer::Env(EnvConfig { filters }))
+}
+
+/// Applies the built-in verbose filter policy only when no explicit filter was
+/// configured.
+fn apply_default_debug_log_filter(tracing: &mut TracingConfig) {
+    if !matches!(tracing.filter, Layer::None) {
+        return;
+    }
+
+    if let Some(filter) = default_envfilter_config(tracing.level) {
+        tracing.filter = Layer::Env(EnvConfig {
+            filters: filter.filters,
+        });
+    }
 }
 
 pub fn update_network(network: &mut NetworkConfig, network_args: NetworkArgs) -> Result<()> {
@@ -501,11 +508,24 @@ pub enum ConfigDeserializationError<Config> {
     IoError(#[from] std::io::Error),
     #[error(transparent)]
     SerdeError(#[from] serde_yaml::Error),
+    #[error("YAML include error: {0}")]
+    IncludeError(String),
 }
 
 pub enum OnUnknownKeys {
     Fail,
     Warn,
+}
+
+impl<C> From<lb_utils::yaml::YamlIncludeError> for ConfigDeserializationError<C> {
+    fn from(e: lb_utils::yaml::YamlIncludeError) -> Self {
+        use lb_utils::yaml::YamlIncludeError as E;
+        match e {
+            E::Io(e) => Self::IoError(e),
+            E::Serde(e) => Self::SerdeError(e),
+            E::InvalidInclude(msg) => Self::IncludeError(msg),
+        }
+    }
 }
 
 pub fn deserialize_config_at_path<Config>(
@@ -515,8 +535,30 @@ pub fn deserialize_config_at_path<Config>(
 where
     Config: for<'de> Deserialize<'de>,
 {
+    let base_dir = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
     let file = std::fs::File::open(config_path)?;
-    deserialize_config_from_reader(file, unknown_keys_strategy)
+    let raw: serde_yaml::Value = serde_yaml::from_reader(file)?;
+    let resolved = lb_utils::yaml::resolve_includes(raw, &base_dir)
+        .map_err(ConfigDeserializationError::from)?;
+    deserialize_from_value(resolved, unknown_keys_strategy)
+}
+
+fn deserialize_from_value<Config>(
+    value: serde_yaml::Value,
+    unknown_keys_strategy: OnUnknownKeys,
+) -> Result<Config, ConfigDeserializationError<Config>>
+where
+    Config: for<'de> Deserialize<'de>,
+{
+    use serde::de::IntoDeserializer as _;
+    let mut ignored_fields = Vec::new();
+    let config = serde_ignored::deserialize::<_, _, Config>(value.into_deserializer(), |path| {
+        ignored_fields.push(path.to_string());
+    })?;
+    apply_unknown_keys_strategy(config, ignored_fields, unknown_keys_strategy)
 }
 
 pub fn deserialize_config_from_reader<Config, Reader>(
@@ -534,8 +576,15 @@ where
             ignored_fields.push(path.to_string());
         },
     )?;
+    apply_unknown_keys_strategy(config, ignored_fields, unknown_keys_strategy)
+}
 
-    match (ignored_fields, unknown_keys_strategy) {
+fn apply_unknown_keys_strategy<Config>(
+    config: Config,
+    ignored_fields: Vec<String>,
+    strategy: OnUnknownKeys,
+) -> Result<Config, ConfigDeserializationError<Config>> {
+    match (ignored_fields, strategy) {
         (ignored_fields, _) if ignored_fields.is_empty() => Ok(config),
         (ignored_fields, OnUnknownKeys::Warn) => {
             warn!(

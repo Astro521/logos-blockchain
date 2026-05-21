@@ -6,6 +6,7 @@ use lb_blend_message::{
 use lb_blend_proofs::quota::inputs::prove::public::{CoreInputs, LeaderInputs};
 use lb_core::{
     crypto::ZkHash,
+    mantle::Value,
     sdp::{ProviderId, SessionNumber},
 };
 use lb_cryptarchia_engine::Epoch;
@@ -24,8 +25,7 @@ use crate::{
 /// Immutable state of the current session.
 /// The current session is `s` if `s-1` is the target session for which rewards
 /// are being calculated.
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CurrentSessionState {
     /// Current session randomness
     session_randomness: SessionRandomness,
@@ -44,13 +44,14 @@ impl CurrentSessionState {
 /// Collects epoch states seen in the current session.
 /// The current session is `s` if `s-1` is the target session for which rewards
 /// are being calculated.
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CurrentSessionTracker {
     /// Collecting leader inputs derived from epoch states seen in the current
     /// session. These will be used to create proof verifiers after the next
     /// session update.
     leader_inputs: HashTrieMapSync<Epoch, LeaderInputs>,
+    /// Collecting service rewards over the session
+    session_income: Value,
 }
 
 impl CurrentSessionTracker {
@@ -61,6 +62,7 @@ impl CurrentSessionTracker {
                 settings.leader_inputs(first_epoch_state),
             ))
             .collect(),
+            session_income: Value::default(),
         }
     }
 
@@ -69,6 +71,14 @@ impl CurrentSessionTracker {
             leader_inputs: self
                 .leader_inputs
                 .insert(epoch_state.epoch, settings.leader_inputs(epoch_state)),
+            session_income: self.session_income,
+        }
+    }
+
+    pub(crate) fn add_block_rewards(&self, block_rewards: Value) -> Self {
+        Self {
+            leader_inputs: self.leader_inputs.clone(),
+            session_income: self.session_income + block_rewards,
         }
     }
 
@@ -120,6 +130,7 @@ impl CurrentSessionTracker {
                 providers,
                 token_evaluation,
                 proof_verifiers,
+                self.session_income,
             ),
             current_session_state: CurrentSessionState::new(SessionRandomness::new(
                 last_active_session_state.session_n + 1,

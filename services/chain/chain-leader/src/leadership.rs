@@ -13,7 +13,10 @@ use lb_ledger::{EpochState, UtxoTree};
 use lb_wallet_service::{UtxoWithKeyId, api::WalletApi};
 use overwatch::services::AsServiceId;
 use rand::rngs::OsRng;
-use tokio::sync::{oneshot, watch::Sender};
+use tokio::{
+    sync::{oneshot, watch::Sender},
+    time::Instant,
+};
 
 use crate::{WinningPolInfo, kms::KmsAdapter};
 
@@ -22,6 +25,10 @@ use crate::{WinningPolInfo, kms::KmsAdapter};
 ///
 /// If the slot is not a winning one, it returns `None` and no consumer is
 /// notified.
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "TODO: address this in a dedicated refactor"
+)]
 pub async fn build_proof_for<Wallet, RuntimeServiceId>(
     utxos: &[UtxoWithKeyId],
     latest_tree: &UtxoTree,
@@ -228,6 +235,10 @@ impl<'service> PotentialWinningPoLSlotNotifier<'service> {
             .await;
     }
 
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "TODO: address this in a dedicated refactor"
+    )]
     async fn check_epoch_winning_utxos<RuntimeServiceId>(
         &mut self,
         utxos: &[UtxoWithKeyId],
@@ -243,6 +254,7 @@ impl<'service> PotentialWinningPoLSlotNotifier<'service> {
             .into();
 
         let mut first_winning_slot: Option<Slot> = None;
+        let start = Instant::now();
         for UtxoWithKeyId { utxo, key_id } in utxos {
             for offset in 0..slots_per_epoch {
                 let slot = epoch_starting_slot
@@ -255,7 +267,7 @@ impl<'service> PotentialWinningPoLSlotNotifier<'service> {
                 if !winning {
                     continue;
                 }
-                tracing::debug!("Found winning utxo with ID {:?} for slot {slot}", utxo.id());
+                tracing::trace!("Found winning utxo with ID {:?} for slot {slot}", utxo.id());
 
                 // Note: We discard the signing key here since this is just for pre-computing
                 // winning slots. The actual signing key will be generated when building the
@@ -285,7 +297,7 @@ impl<'service> PotentialWinningPoLSlotNotifier<'service> {
                     .send(Some((leader_private, public_inputs, epoch_state.epoch)))
                     .is_err()
                 {
-                    tracing::debug!(
+                    tracing::trace!(
                         "No active listeners for pre-calculated PoL winning slots. Not broadcasting."
                     );
                 } else {
@@ -296,6 +308,20 @@ impl<'service> PotentialWinningPoLSlotNotifier<'service> {
                 }
             }
         }
+        tracing::debug!(
+            "Found all winning utxos for epoch {:?} in {:?} ms",
+            epoch_state.epoch,
+            start.elapsed().as_millis()
+        );
+
+        if first_winning_slot.is_none() {
+            tracing::debug!(
+                "Found no winning slots for epoch {:?} across {} wallet UTXOs",
+                epoch_state.epoch,
+                utxos.len()
+            );
+        }
+
         self.last_processed_epoch_and_found_first_winning_slot =
             Some((epoch_state.epoch, first_winning_slot));
     }
@@ -327,7 +353,7 @@ impl<'service> PotentialWinningPoLSlotNotifier<'service> {
             .send(Some((private_inputs, public_inputs, epoch)))
             .is_err()
         {
-            tracing::debug!(
+            tracing::trace!(
                 "No active listeners for pre-calculated PoL winning slots. Not broadcasting."
             );
         }
@@ -341,8 +367,8 @@ mod pol_tests {
 
     use lb_core::{
         mantle::{
-            ledger::{Note, Tx},
-            ops::leader_claim::VoucherCm,
+            ledger::{Inputs, Note, Outputs},
+            ops::{leader_claim::VoucherCm, transfer::TransferOp},
         },
         proofs::leader_proof::{LeaderProof as _, check_winning},
         sdp::{MinStake, ServiceParameters, ServiceType},
@@ -377,9 +403,11 @@ mod pol_tests {
         let pk = sk.to_public_key();
 
         // Create a UTXO
-        let utxo = Tx::new(vec![], vec![Note::new(1000u64, pk)])
-            .utxo_by_index(0)
-            .unwrap();
+        let transfer = TransferOp::new(
+            Inputs::new(vec![]),
+            Outputs::new(vec![Note::new(1000u64, pk)]),
+        );
+        let utxo = transfer.outputs.utxo_by_index(0, &transfer).unwrap();
 
         // Create aged/latest UTXO trees
         let aged_tree = UtxoTree::new().insert(utxo.id(), utxo).0;

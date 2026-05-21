@@ -23,7 +23,7 @@ pub struct BootstrapConfig {
 impl Default for BootstrapConfig {
     fn default() -> Self {
         Self {
-            prolonged_bootstrap_period: Duration::from_mins(5),
+            prolonged_bootstrap_period: Duration::from_hours(1),
             force_bootstrap: bool::default(),
             offline_grace_period: OfflineGracePeriodConfig::default(),
         }
@@ -46,7 +46,7 @@ impl Default for OfflineGracePeriodConfig {
     fn default() -> Self {
         Self {
             grace_period: Duration::from_mins(20),
-            state_recording_interval: Duration::from_secs(60),
+            state_recording_interval: Duration::from_mins(1),
         }
     }
 }

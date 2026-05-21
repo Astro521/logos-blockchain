@@ -1,59 +1,43 @@
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Op,
-    channel::{inscribe::InscriptionOp, set_keys::SetKeysOp},
+    CHANNEL_CONFIG, CHANNEL_DEPOSIT, CHANNEL_WITHDRAW, INSCRIBE, LEADER_CLAIM, Op, SDP_ACTIVE,
+    SDP_DECLARE, SDP_WITHDRAW, TRANSFER,
+    channel::{config::ChannelConfigOp, deposit::DepositOp, inscribe::InscriptionOp},
     leader_claim::LeaderClaimOp,
-    opcode::{INSCRIBE, LEADER_CLAIM, SDP_ACTIVE, SDP_DECLARE, SDP_WITHDRAW, SET_CHANNEL_KEYS},
     sdp::{SDPActiveOp, SDPDeclareOp, SDPWithdrawOp},
-    serde_,
+    serde_::OpWire,
+    transfer::TransferOp,
 };
+use crate::mantle::ops::channel::withdraw::ChannelWithdrawOp;
 
 /// Core set of supported Mantle operations and their serialization behaviour.
 #[derive(Serialize)]
 #[serde(untagged)]
 pub enum OpSer<'a> {
-    ChannelInscribe(
-        #[serde(serialize_with = "serde_::serialize_op_variant::<{INSCRIBE}, InscriptionOp, _>")]
-        &'a InscriptionOp,
-    ),
-    ChannelSetKeys(
-        #[serde(
-            serialize_with = "serde_::serialize_op_variant::<{SET_CHANNEL_KEYS}, SetKeysOp, _>"
-        )]
-        &'a SetKeysOp,
-    ),
-    SDPDeclare(
-        #[serde(serialize_with = "serde_::serialize_op_variant::<{SDP_DECLARE}, SDPDeclareOp, _>")]
-        &'a SDPDeclareOp,
-    ),
-    SDPWithdraw(
-        #[serde(
-            serialize_with = "serde_::serialize_op_variant::<{SDP_WITHDRAW}, SDPWithdrawOp, _>"
-        )]
-        &'a SDPWithdrawOp,
-    ),
-    SDPActive(
-        #[serde(serialize_with = "serde_::serialize_op_variant::<{SDP_ACTIVE}, SDPActiveOp, _>")]
-        &'a SDPActiveOp,
-    ),
-    LeaderClaim(
-        #[serde(
-            serialize_with = "serde_::serialize_op_variant::<{LEADER_CLAIM}, LeaderClaimOp, _>"
-        )]
-        &'a LeaderClaimOp,
-    ),
+    ChannelInscribe(OpWire<INSCRIBE, &'a InscriptionOp>),
+    ChannelConfig(OpWire<CHANNEL_CONFIG, &'a ChannelConfigOp>),
+    ChannelDeposit(OpWire<CHANNEL_DEPOSIT, &'a DepositOp>),
+    ChannelWithdraw(OpWire<CHANNEL_WITHDRAW, &'a ChannelWithdrawOp>),
+    SDPDeclare(OpWire<SDP_DECLARE, &'a SDPDeclareOp>),
+    SDPWithdraw(OpWire<SDP_WITHDRAW, &'a SDPWithdrawOp>),
+    SDPActive(OpWire<SDP_ACTIVE, &'a SDPActiveOp>),
+    LeaderClaim(OpWire<LEADER_CLAIM, &'a LeaderClaimOp>),
+    Transfer(OpWire<TRANSFER, &'a TransferOp>),
 }
 
 impl<'a> From<&'a Op> for OpSer<'a> {
     fn from(value: &'a Op) -> Self {
         match value {
-            Op::ChannelInscribe(op) => OpSer::ChannelInscribe(op),
-            Op::ChannelSetKeys(op) => OpSer::ChannelSetKeys(op),
-            Op::SDPDeclare(op) => OpSer::SDPDeclare(op),
-            Op::SDPWithdraw(op) => OpSer::SDPWithdraw(op),
-            Op::SDPActive(op) => OpSer::SDPActive(op),
-            Op::LeaderClaim(op) => OpSer::LeaderClaim(op),
+            Op::ChannelInscribe(op) => Self::ChannelInscribe(OpWire::new(op)),
+            Op::ChannelConfig(op) => Self::ChannelConfig(OpWire::new(op)),
+            Op::ChannelDeposit(op) => Self::ChannelDeposit(OpWire::new(op)),
+            Op::ChannelWithdraw(op) => Self::ChannelWithdraw(OpWire::new(op)),
+            Op::SDPDeclare(op) => Self::SDPDeclare(OpWire::new(op)),
+            Op::SDPWithdraw(op) => Self::SDPWithdraw(OpWire::new(op)),
+            Op::SDPActive(op) => Self::SDPActive(OpWire::new(op)),
+            Op::LeaderClaim(op) => Self::LeaderClaim(OpWire::new(op)),
+            Op::Transfer(op) => Self::Transfer(OpWire::new(op)),
         }
     }
 }
@@ -62,53 +46,29 @@ impl<'a> From<&'a Op> for OpSer<'a> {
 #[derive(Deserialize)]
 #[serde(untagged)]
 pub enum OpDe {
-    ChannelInscribe(
-        #[serde(
-            deserialize_with = "serde_::deserialize_op_variant::<{INSCRIBE}, InscriptionOp, _>"
-        )]
-        InscriptionOp,
-    ),
-    ChannelSetKeys(
-        #[serde(
-            deserialize_with = "serde_::deserialize_op_variant::<{SET_CHANNEL_KEYS}, SetKeysOp, _>"
-        )]
-        SetKeysOp,
-    ),
-    SDPDeclare(
-        #[serde(
-            deserialize_with = "serde_::deserialize_op_variant::<{SDP_DECLARE}, SDPDeclareOp, _>"
-        )]
-        SDPDeclareOp,
-    ),
-    SDPWithdraw(
-        #[serde(
-            deserialize_with = "serde_::deserialize_op_variant::<{SDP_WITHDRAW}, SDPWithdrawOp, _>"
-        )]
-        SDPWithdrawOp,
-    ),
-    SDPActive(
-        #[serde(
-            deserialize_with = "serde_::deserialize_op_variant::<{SDP_ACTIVE}, SDPActiveOp, _>"
-        )]
-        SDPActiveOp,
-    ),
-    LeaderClaim(
-        #[serde(
-            deserialize_with = "serde_::deserialize_op_variant::<{LEADER_CLAIM}, LeaderClaimOp, _>"
-        )]
-        LeaderClaimOp,
-    ),
+    ChannelInscribe(OpWire<INSCRIBE, InscriptionOp>),
+    ChannelConfig(OpWire<CHANNEL_CONFIG, ChannelConfigOp>),
+    ChannelDeposit(OpWire<CHANNEL_DEPOSIT, DepositOp>),
+    ChannelWithdraw(OpWire<CHANNEL_WITHDRAW, ChannelWithdrawOp>),
+    SDPDeclare(OpWire<SDP_DECLARE, SDPDeclareOp>),
+    SDPWithdraw(OpWire<SDP_WITHDRAW, SDPWithdrawOp>),
+    SDPActive(OpWire<SDP_ACTIVE, SDPActiveOp>),
+    LeaderClaim(OpWire<LEADER_CLAIM, LeaderClaimOp>),
+    Transfer(OpWire<TRANSFER, TransferOp>),
 }
 
 impl From<OpDe> for Op {
     fn from(value: OpDe) -> Self {
         match value {
-            OpDe::ChannelInscribe(inscribe) => Self::ChannelInscribe(inscribe),
-            OpDe::ChannelSetKeys(channel_set_keys) => Self::ChannelSetKeys(channel_set_keys),
-            OpDe::SDPDeclare(sdp_declare) => Self::SDPDeclare(sdp_declare),
-            OpDe::SDPWithdraw(sdp_withdraw) => Self::SDPWithdraw(sdp_withdraw),
-            OpDe::SDPActive(sdp_active) => Self::SDPActive(sdp_active),
-            OpDe::LeaderClaim(leader_claim) => Self::LeaderClaim(leader_claim),
+            OpDe::ChannelInscribe(w) => Self::ChannelInscribe(w.into_op()),
+            OpDe::ChannelConfig(w) => Self::ChannelConfig(w.into_op()),
+            OpDe::ChannelDeposit(w) => Self::ChannelDeposit(w.into_op()),
+            OpDe::ChannelWithdraw(w) => Self::ChannelWithdraw(w.into_op()),
+            OpDe::SDPDeclare(w) => Self::SDPDeclare(w.into_op()),
+            OpDe::SDPWithdraw(w) => Self::SDPWithdraw(w.into_op()),
+            OpDe::SDPActive(w) => Self::SDPActive(w.into_op()),
+            OpDe::LeaderClaim(w) => Self::LeaderClaim(w.into_op()),
+            OpDe::Transfer(w) => Self::Transfer(w.into_op()),
         }
     }
 }

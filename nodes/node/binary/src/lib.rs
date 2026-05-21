@@ -1,10 +1,13 @@
 pub mod api;
+pub mod cli;
 pub mod config;
 pub mod generic_services;
-#[cfg(feature = "config-gen")]
-pub mod init;
+pub mod panic;
 
-use cfg_if::cfg_if;
+pub mod global_allocators;
+
+use std::panic::set_hook;
+
 use color_eyre::eyre::{Result, eyre};
 pub use lb_blend_service::{
     core::{
@@ -25,7 +28,6 @@ pub use lb_storage_service::backends::{
 };
 pub use lb_system_sig_service::SystemSig;
 use lb_time_service::backends::NtpTimeBackend;
-#[cfg(feature = "tracing")]
 pub use lb_tracing_service::Tracing;
 use lb_tx_service::storage::adapters::RocksStorageAdapter;
 pub use lb_tx_service::{
@@ -39,8 +41,8 @@ use overwatch::{
     DynError, derive_services,
     overwatch::{Error as OverwatchError, Overwatch, OverwatchRunner},
 };
+use tokio::runtime;
 
-pub use crate::config::{ApiArgs, Command, LogArgs, NetworkArgs, UserConfig};
 use crate::{
     api::backend::AxumBackend,
     config::{
@@ -50,12 +52,16 @@ use crate::{
         sdp::ServiceConfig as SdpConfig, storage::ServiceConfig as StorageConfig,
         time::ServiceConfig as TimeConfig, wallet::ServiceConfig as WalletConfig,
     },
-    generic_services::{SdpMempoolAdapter, SdpService, SdpWalletAdapter},
+    generic_services::{SdpMempoolAdapter, SdpRecoveryBackend, SdpService, SdpWalletAdapter},
+    panic::log_and_exit_hook,
+};
+pub use crate::{
+    cli::Command,
+    config::{ApiArgs, LogArgs, NetworkArgs, UserConfig},
 };
 
 pub const MB16: usize = 1024 * 1024 * 16;
 
-#[cfg(feature = "tracing")]
 pub(crate) type TracingService = Tracing<RuntimeServiceId>;
 
 pub(crate) type NetworkService =
@@ -64,6 +70,8 @@ pub(crate) type NetworkService =
 pub(crate) type BlendCoreService = generic_services::blend::BlendCoreService<RuntimeServiceId>;
 pub(crate) type BlendEdgeService = generic_services::blend::BlendEdgeService<RuntimeServiceId>;
 pub(crate) type BlendService = generic_services::blend::BlendService<RuntimeServiceId>;
+pub(crate) type BlendBroadcastSettings =
+    generic_services::blend::BlendBroadcastSettings<RuntimeServiceId>;
 
 pub(crate) type BlockBroadcastService =
     lb_chain_broadcast_service::BlockBroadcastService<RuntimeServiceId>;
@@ -98,6 +106,7 @@ pub type ApiService = lb_api_service::ApiService<
         RocksStorageAdapter<SignedMantleTx, TxHash>,
         SdpMempoolAdapter<RuntimeServiceId>,
         SdpWalletAdapter<RuntimeServiceId>,
+        SdpRecoveryBackend,
         CryptarchiaLeaderService,
     >,
     RuntimeServiceId,
@@ -133,7 +142,6 @@ pub struct LogosBlockchain {
     #[cfg(feature = "testing")]
     testing_http: TestingApiService<RuntimeServiceId>,
 
-    #[cfg(feature = "tracing")]
     tracing: TracingService,
 }
 
@@ -191,9 +199,8 @@ pub fn run_node_from_config(config: RunConfig) -> Result<Overwatch<RuntimeServic
     let sdp_config = SdpConfig {
         user: config.user.sdp,
     }
-    .into();
+    .into_sdp_service_settings(&config.user.state);
 
-    #[cfg(feature = "tracing")]
     let tracing_config = config::tracing::ServiceConfig {
         user: config.user.tracing,
     }
@@ -203,13 +210,12 @@ pub fn run_node_from_config(config: RunConfig) -> Result<Overwatch<RuntimeServic
         user: config.user.api,
     };
 
-    cfg_if! {
-        if #[cfg(feature = "testing")] {
-            let (http_config, testing_config) = api_config.into_backend_and_testing_settings();
-        } else {
-            let http_config = api_config.into_backend_settings();
-        }
-    }
+    let http_config = api_config.backend_settings();
+
+    #[cfg(feature = "testing")]
+    let testing_config = api_config.testing_settings();
+
+    set_hook(Box::new(log_and_exit_hook));
 
     let app = OverwatchRunner::<LogosBlockchain>::run(
         LogosBlockchainServiceSettings {
@@ -230,13 +236,12 @@ pub fn run_node_from_config(config: RunConfig) -> Result<Overwatch<RuntimeServic
             sdp: sdp_config,
             wallet: wallet_config,
 
-            #[cfg(feature = "tracing")]
             tracing: tracing_config,
 
             #[cfg(feature = "testing")]
             testing_http: testing_config,
         },
-        None,
+        handle,
     )
     .map_err(|e| eyre!("Error encountered: {}", e))?;
     Ok(app)

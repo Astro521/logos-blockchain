@@ -6,6 +6,7 @@ use lb_blend_proofs::quota::inputs::prove::{
     private::ProofOfLeadershipQuotaInputs, public::LeaderInputs,
 };
 use lb_cryptarchia_engine::Epoch;
+use lb_log_targets::blend;
 
 use crate::message_blend::{
     CoreProofOfQuotaGenerator,
@@ -19,7 +20,7 @@ use crate::message_blend::{
 #[cfg(test)]
 mod tests;
 
-const LOG_TARGET: &str = "blend::scheduling::proofs::core-and-leader";
+const LOG_TARGET: &str = blend::scheduling::proofs::CORE_AND_LEADER;
 
 /// Proof generator for core and leader `PoQ` variants.
 ///
@@ -94,6 +95,10 @@ where
     // Changes epoch-related info for the core generator, and stops the old leader
     // generator if it's still on the previous epoch. If not, `rotate_epoch` is
     // effectively a no-op.
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "TODO: address this in a dedicated refactor"
+    )]
     fn rotate_epoch(&mut self, new_epoch_public: LeaderInputs, new_epoch: Epoch) {
         match self.core_proofs_generator.current_epoch().cmp(&new_epoch) {
             Ordering::Less => {
@@ -158,6 +163,7 @@ where
                     session: current_session,
                     leader: new_epoch_public,
                 },
+                encapsulation_layers: self.core_proofs_generator.settings.encapsulation_layers,
             },
             new_epoch_private,
         ));
@@ -165,7 +171,17 @@ where
 
     async fn get_next_core_proof(&mut self) -> Option<BlendLayerProof> {
         let proof = self.core_proofs_generator.get_next_proof().await?;
-        tracing::debug!(target: LOG_TARGET, "Generated core PoQ {:?} with settings: {:?}, epoch: {:?} and signing key: {:?}", proof.proof_of_quota, self.core_proofs_generator.settings, self.core_proofs_generator.settings.epoch, proof.ephemeral_signing_key.public_key());
+        tracing::trace!(
+            target: LOG_TARGET,
+            epoch = ?self.core_proofs_generator.settings.epoch,
+            session = self.core_proofs_generator.settings.public_inputs.session,
+            quota = self.core_proofs_generator.settings.public_inputs.core.quota,
+            membership_size = self.core_proofs_generator.settings.membership_size,
+            local_node_index = ?self.core_proofs_generator.settings.local_node_index,
+            key_nullifier = ?proof.proof_of_quota.key_nullifier(),
+            signing_key = ?proof.ephemeral_signing_key.public_key(),
+            "generated core PoQ"
+        );
         Some(proof)
     }
 
@@ -174,7 +190,17 @@ where
             return None;
         };
         let proof = leader_proofs_generator.get_next_proof().await;
-        tracing::debug!(target: LOG_TARGET, "Generated leadership PoQ {:?} with settings: {:?}, epoch: {:?} and signing key: {:?}", proof.proof_of_quota, leader_proofs_generator.settings, leader_proofs_generator.settings.epoch, proof.ephemeral_signing_key.public_key());
+        tracing::trace!(
+            target: LOG_TARGET,
+            epoch = ?leader_proofs_generator.settings.epoch,
+            session = leader_proofs_generator.settings.public_inputs.session,
+            quota = leader_proofs_generator.settings.public_inputs.core.quota,
+            membership_size = leader_proofs_generator.settings.membership_size,
+            local_node_index = ?leader_proofs_generator.settings.local_node_index,
+            key_nullifier = ?proof.proof_of_quota.key_nullifier(),
+            signing_key = ?proof.ephemeral_signing_key.public_key(),
+            "generated leadership PoQ"
+        );
         Some(proof)
     }
 }

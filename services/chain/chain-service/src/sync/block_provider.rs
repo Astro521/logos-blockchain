@@ -10,19 +10,19 @@ use bytes::Bytes;
 use futures::{StreamExt as _, TryStreamExt as _, future, stream, stream::BoxStream};
 use lb_core::{block::Block, header::HeaderId};
 use lb_cryptarchia_engine::{Branch, Slot};
-use lb_cryptarchia_sync::{BlocksResponse, ProviderResponse};
+use lb_cryptarchia_sync::{BlocksResponse, BlocksUnavailableReason, ProviderResponse};
 use lb_storage_service::{StorageMsg, api::chain::StorageChainApi, backends::StorageBackend};
 use overwatch::DynError;
 use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{mpsc::Sender, oneshot};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::relays::StorageRelay;
 
 const MAX_NUMBER_OF_BLOCKS: usize = 1000;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum GetBlocksError {
     #[error("Storage channel dropped")]
     ChannelDropped,
@@ -99,11 +99,23 @@ where
                 }
             }
             Err(e) => {
-                Self::send_error(
-                    format!("Failed to create a block stream: {e:?}"),
-                    reply_sender,
-                )
-                .await;
+                let reason = e.downcast_ref::<GetBlocksError>().map_or_else(
+                    || {
+                        BlocksUnavailableReason::Unknown(format!(
+                            "Failed to create a block stream: {e:?}"
+                        ))
+                    },
+                    |err| match err {
+                        GetBlocksError::BlockNotFound(id) => {
+                            BlocksUnavailableReason::BlockNotFound(*id)
+                        }
+                        GetBlocksError::StartBlockNotFound => {
+                            BlocksUnavailableReason::StartBlockNotFound
+                        }
+                        other => BlocksUnavailableReason::Unknown(other.to_string()),
+                    },
+                );
+                Self::send_error(reason, reply_sender).await;
             }
         }
     }
@@ -128,6 +140,15 @@ where
         let path = self
             .find_path(cryptarchia, target_block, known_blocks)
             .await?;
+
+        if let (Some(start_block), Some(end_block)) = (path.first(), path.last()) {
+            debug!(
+                "Prepared block stream from {:?} to {:?} with {} path entries",
+                start_block,
+                end_block,
+                path.len()
+            );
+        }
 
         let stream = self.stream_blocks_from_path(path);
         Ok(stream)
@@ -470,8 +491,8 @@ where
             .map_err(|(e, _)| GetBlocksError::SendError(e.to_string()))?;
 
         match rx.await.map_err(|_| GetBlocksError::ChannelDropped)? {
-            Some(_) => Ok(Some(block)),
-            None => Ok(None),
+            Some(immutable_id) if immutable_id == id => Ok(Some(block)),
+            Some(_) | None => Ok(None),
         }
     }
 
@@ -537,8 +558,15 @@ where
         rx.await.map_err(|_| GetBlocksError::ChannelDropped)
     }
 
-    async fn send_error(reason: String, reply_sender: Sender<BlocksResponse>) {
-        error!(reason);
+    async fn send_error(reason: BlocksUnavailableReason, reply_sender: Sender<BlocksResponse>) {
+        if let BlocksUnavailableReason::BlockNotFound(target) = &reason {
+            error!(
+                ?target,
+                "Failed to create a block stream: requested target block is unavailable"
+            );
+        } else {
+            error!(reason = %reason, "Failed to create a block stream");
+        }
 
         if let Err(e) = reply_sender
             .send(ProviderResponse::Unavailable { reason })
@@ -558,6 +586,7 @@ mod tests {
     use lb_core::{
         codec::DeserializeOp as _,
         crypto::ZkHasher,
+        events::Events,
         mantle::{Note, SignedMantleTx, ledger::Utxo, ops::leader_claim::VoucherCm},
         proofs::leader_proof::{LeaderPrivate, LeaderPublic},
     };
@@ -570,7 +599,6 @@ mod tests {
     };
     use lb_utils::math::NonNegativeRatio;
     use lb_utxotree::UtxoTree;
-    use num_bigint::BigUint;
     use overwatch::{derive_services, overwatch::OverwatchRunner};
     use tempfile::TempDir;
     use tokio::{runtime::Handle, sync::mpsc};
@@ -606,6 +634,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_storage_block_at_immutable_slot_must_match_immutable_id() {
+        let env = TestEnv::new().await;
+
+        let ids = env.create_storage_only_blocks(3).await;
+        let stale_block = env
+            .build_block_with_parent(ids[0], Slot::from(2))
+            .expect("stale block should be valid");
+
+        let stale_block_id = stale_block.header().id();
+        assert_ne!(stale_block_id, ids[2]);
+
+        env.store_block_only(&stale_block, stale_block_id).await;
+
+        let known_blocks = HashSet::from([ids[0]]);
+        env.test_error_scenario(
+            stale_block_id,
+            &known_blocks,
+            BlocksUnavailableReason::BlockNotFound(stale_block_id),
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_storage_to_engine_hybrid_path() {
         let mut env = TestEnv::new().await;
 
@@ -634,8 +685,12 @@ mod tests {
         let known_blocks = HashSet::from([ids[0]]);
         let fake_target = HeaderId::from([99u8; 32]);
 
-        env.test_error_scenario(fake_target, &known_blocks, "BlockNotFound")
-            .await;
+        env.test_error_scenario(
+            fake_target,
+            &known_blocks,
+            BlocksUnavailableReason::BlockNotFound(fake_target),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -646,8 +701,12 @@ mod tests {
         let fake_known = HashSet::from([HeaderId::from([98u8; 32]), HeaderId::from([97u8; 32])]);
         let target_block = ids[4];
 
-        env.test_error_scenario(target_block, &fake_known, "StartBlockNotFound")
-            .await;
+        env.test_error_scenario(
+            target_block,
+            &fake_known,
+            BlocksUnavailableReason::StartBlockNotFound,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -657,8 +716,12 @@ mod tests {
         let fake_target_block = HeaderId::from([88u8; 32]);
         let known_blocks = HashSet::from([HeaderId::from([99u8; 32])]);
 
-        env.test_error_scenario(fake_target_block, &known_blocks, "BlockNotFound")
-            .await;
+        env.test_error_scenario(
+            fake_target_block,
+            &known_blocks,
+            BlocksUnavailableReason::BlockNotFound(fake_target_block),
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -806,11 +869,9 @@ mod tests {
                 }
 
                 if i > 0 {
-                    self.cryptarchia = self
-                        .cryptarchia
+                    self.cryptarchia
                         .receive_block(*header_id, *prev_header, *slot)
-                        .expect("Failed to add block to cryptarchia")
-                        .cryptarchia;
+                        .expect("Failed to add block to cryptarchia");
                 }
 
                 // Store in storage but NOT as immutable storage
@@ -844,21 +905,22 @@ mod tests {
             prev_header: HeaderId,
             slot: Slot,
         ) {
-            self.cryptarchia = self
-                .cryptarchia
+            self.cryptarchia
                 .receive_block(header_id, prev_header, slot)
-                .expect("Failed to add block to cryptarchia")
-                .cryptarchia;
+                .expect("Failed to add block to cryptarchia");
 
             self.store_block_in_storage(block, header_id, slot).await;
         }
 
         async fn store_block_only(&self, block: &Block<SignedMantleTx>, header_id: HeaderId) {
+            let parent_id = block.header().parent();
             let store_result: Result<_, _> = block.clone().try_into();
             self.storage_relay
                 .send(StorageMsg::store_block_request(
                     header_id,
+                    parent_id,
                     store_result.unwrap(),
+                    Events::new().try_into().unwrap(),
                 ))
                 .await
                 .expect("Failed to store block");
@@ -927,29 +989,37 @@ mod tests {
             &self,
             target_block: HeaderId,
             known_blocks: &HashSet<HeaderId>,
-            expected_error_type: &str,
+            expected_reason: BlocksUnavailableReason,
         ) {
             let (tx, mut rx) = mpsc::channel(1);
             self.provider
                 .send_blocks(&self.cryptarchia, target_block, known_blocks, tx)
                 .await;
 
-            let error_occurred = if let Some(response) = rx.recv().await {
+            let (error_occurred, actual_outcome) = if let Some(response) = rx.recv().await {
                 match response {
                     ProviderResponse::Unavailable { reason } => {
-                        reason.contains(expected_error_type)
+                        (reason == expected_reason, format!("Unavailable({reason})"))
                     }
-                    ProviderResponse::Available(mut stream) => {
-                        stream.next().await.is_some_and(|result| result.is_err())
-                    }
+                    ProviderResponse::Available(mut stream) => match stream.next().await {
+                        Some(Ok(bytes)) => {
+                            let block: Block<()> = Block::from_bytes(&bytes).unwrap();
+                            (
+                                false,
+                                format!("Available(first_block={:?})", block.header().id()),
+                            )
+                        }
+                        Some(Err(err)) => (false, format!("Available(first_err={err})")),
+                        None => (false, "Available(empty_stream)".to_owned()),
+                    },
                 }
             } else {
-                false
+                (false, "No response received".to_owned())
             };
 
             assert!(
                 error_occurred,
-                "Expected {expected_error_type} error but operation succeeded",
+                "Expected {expected_reason} but got {actual_outcome}",
             );
         }
 
@@ -958,7 +1028,7 @@ mod tests {
         ) -> lb_core::proofs::leader_proof::Groth16LeaderProof {
             let leader_sk = UnsecuredZkKey::zero();
             let utxo = Utxo {
-                tx_hash: Fr::from(BigUint::from(1u8)).into(),
+                op_id: [1u8; 32],
                 output_index: 0,
                 note: Note::new(1000, leader_sk.to_public_key()),
             };

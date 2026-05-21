@@ -7,10 +7,8 @@ use lb_core::{
 use tokio::sync::oneshot::Sender;
 
 use crate::{
-    StorageMsg, StorageServiceError,
-    api::{
-        StorageApiRequest, StorageBackendApi, StorageOperation, membership::StorageMembershipApi,
-    },
+    StorageServiceError,
+    api::{StorageBackendApi, StorageOperation, membership::StorageMembershipApi},
     backends::StorageBackend,
 };
 
@@ -32,12 +30,12 @@ pub enum MembershipApiRequest {
     LoadLatestBlock {
         response_tx: Sender<Option<BlockNumber>>,
     },
-    SaveFormingSession {
+    SaveNextSession {
         service_type: ServiceType,
         session_id: SessionNumber,
         providers: HashMap<ProviderId, BTreeSet<Locator>>,
     },
-    LoadFormingSession {
+    LoadNextSession {
         service_type: ServiceType,
         response_tx: SessionSender,
     },
@@ -64,15 +62,15 @@ where
             Self::LoadLatestBlock { response_tx } => {
                 handle_load_latest_block(backend, response_tx).await
             }
-            Self::SaveFormingSession {
+            Self::SaveNextSession {
                 service_type,
                 session_id,
                 providers,
-            } => handle_save_forming_session(backend, service_type, session_id, providers).await,
-            Self::LoadFormingSession {
+            } => handle_save_next_session(backend, service_type, session_id, providers).await,
+            Self::LoadNextSession {
                 service_type,
                 response_tx,
-            } => handle_load_forming_session(backend, service_type, response_tx).await,
+            } => handle_load_next_session(backend, service_type, response_tx).await,
         }
     }
 }
@@ -134,108 +132,32 @@ async fn handle_load_latest_block<Backend: StorageBackend + StorageMembershipApi
     Ok(())
 }
 
-async fn handle_save_forming_session<Backend: StorageBackend + StorageMembershipApi>(
+async fn handle_save_next_session<Backend: StorageBackend + StorageMembershipApi>(
     backend: &mut Backend,
     service_type: ServiceType,
     session_id: SessionNumber,
     providers: HashMap<ProviderId, BTreeSet<Locator>>,
 ) -> Result<(), StorageServiceError> {
     backend
-        .save_forming_session(service_type, session_id, &providers)
+        .save_next_session(service_type, session_id, &providers)
         .await
         .map_err(StorageServiceError::BackendError)
 }
 
-async fn handle_load_forming_session<Backend: StorageBackend + StorageMembershipApi>(
+async fn handle_load_next_session<Backend: StorageBackend + StorageMembershipApi>(
     backend: &mut Backend,
     service_type: ServiceType,
     response_tx: SessionSender,
 ) -> Result<(), StorageServiceError> {
     let result = backend
-        .load_forming_session(service_type)
+        .load_next_session(service_type)
         .await
         .map_err(StorageServiceError::BackendError)?;
 
     if response_tx.send(result).is_err() {
         return Err(StorageServiceError::ReplyError {
-            message: "Failed to send reply for load forming session request".to_owned(),
+            message: "Failed to send reply for load next session request".to_owned(),
         });
     }
     Ok(())
-}
-
-impl<Backend: StorageBackend> StorageMsg<Backend> {
-    #[must_use]
-    pub const fn save_active_session_request(
-        service_type: ServiceType,
-        session_id: SessionNumber,
-        providers: HashMap<ProviderId, BTreeSet<Locator>>,
-    ) -> Self {
-        Self::Api {
-            request: StorageApiRequest::Membership(MembershipApiRequest::SaveActiveSession {
-                service_type,
-                session_id,
-                providers,
-            }),
-        }
-    }
-
-    #[must_use]
-    pub const fn load_active_session_request(
-        service_type: ServiceType,
-        response_tx: SessionSender,
-    ) -> Self {
-        Self::Api {
-            request: StorageApiRequest::Membership(MembershipApiRequest::LoadActiveSession {
-                service_type,
-                response_tx,
-            }),
-        }
-    }
-
-    #[must_use]
-    pub const fn save_latest_block_request(block_number: BlockNumber) -> Self {
-        Self::Api {
-            request: StorageApiRequest::Membership(MembershipApiRequest::SaveLatestBlock {
-                block_number,
-            }),
-        }
-    }
-
-    #[must_use]
-    pub const fn load_latest_block_request(response_tx: Sender<Option<BlockNumber>>) -> Self {
-        Self::Api {
-            request: StorageApiRequest::Membership(MembershipApiRequest::LoadLatestBlock {
-                response_tx,
-            }),
-        }
-    }
-
-    #[must_use]
-    pub const fn save_forming_session_request(
-        service_type: ServiceType,
-        session_id: SessionNumber,
-        providers: HashMap<ProviderId, BTreeSet<Locator>>,
-    ) -> Self {
-        Self::Api {
-            request: StorageApiRequest::Membership(MembershipApiRequest::SaveFormingSession {
-                service_type,
-                session_id,
-                providers,
-            }),
-        }
-    }
-
-    #[must_use]
-    pub const fn load_forming_session_request(
-        service_type: ServiceType,
-        response_tx: SessionSender,
-    ) -> Self {
-        Self::Api {
-            request: StorageApiRequest::Membership(MembershipApiRequest::LoadFormingSession {
-                service_type,
-                response_tx,
-            }),
-        }
-    }
 }

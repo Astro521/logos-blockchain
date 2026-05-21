@@ -7,16 +7,25 @@ use std::{
 
 use async_trait::async_trait;
 use config::{api, sdp, state, storage, wallet};
-use lb_core::mantle::{self, genesis_tx::GenesisTx};
+use lb_config::kms::key_id_for_preload_backend;
+use lb_core::{
+    block::genesis::GenesisBlock,
+    mantle::{self},
+};
 use lb_key_management_system_service::keys::{Key, secured_key::SecuredKey as _};
 use lb_libp2p::Multiaddr;
 use lb_node::{
-    UserConfig, config,
-    config::{RunConfig, tracing::serde::logger},
+    UserConfig,
+    config::{
+        self, RunConfig,
+        tracing::serde::{
+            Level,
+            logger::{self, AppenderType},
+        },
+    },
 };
 use rand::Rng as _;
 use testing_framework_core::scenario::{Application, DynError, PeerSelection, StartNodeOptions};
-use testing_framework_env as tf_env;
 use testing_framework_runner_local::{
     BinaryConfig, BinaryResolver, BuiltNodeConfig, LaunchEnvVar, LaunchFile, LocalDeployerEnv,
     NodeConfigEntry, NodeEndpointPort, NodeEndpoints, ProcessSpawnError, env::Node,
@@ -25,24 +34,30 @@ use testing_framework_runner_local::{
 use tracing::debug;
 
 use crate::{
+    LOGOS_BLOCKCHAIN_LOG_LEVEL,
+    diagnostics::{record_system_monitor_event, register_system_monitor_output_file},
+    env as tf_env,
     framework::LbcEnv,
     node::{
         DeploymentPlan, NodeHttpClient, NodePlan,
         configs::{
             Config, Libp2pNetworkLayout, NetworkParams, create_node_config_for_node,
             default_e2e_deployment_settings, deployment::TopologyConfig,
-            key_id_for_preload_backend,
         },
     },
 };
 
 const LOGS_PREFIX: &str = "__logs";
 const DEFAULT_BLEND_NETWORK_PORT: u16 = 3400;
+/// The default filename for the user config.
+pub const USER_CONFIG_FILE: &str = "node.yaml";
+/// The default filename for the deployment config.
+pub const DEPLOYMENT_CONFIG_FILE: &str = "deployment.yaml";
 
-struct BuiltNodeConfigPlan {
-    node_config: Config,
+struct PlannedLocalNodeConfig {
+    config: Config,
     descriptor_override: Option<RunConfig>,
-    genesis_tx: GenesisTx,
+    genesis_block: GenesisBlock,
     port_strategy: PortStrategy,
 }
 
@@ -61,38 +76,44 @@ impl LocalDeployerEnv for LbcEnv {
         options: &StartNodeOptions<Self>,
         peer_ports: &[u16],
     ) -> Result<BuiltNodeConfig<<Self as Application>::NodeConfig>, DynError> {
-        let built = build_node_config_for(
+        build_dynamic_node_config(
             topology,
             index,
             peer_ports_by_name,
-            &options.peers,
+            options,
             peer_ports,
-        )?;
+            None,
+        )
+    }
 
-        let port_strategy = built.port_strategy;
-        let mut config = build_run_config_for_dynamic(built, options.config_override.as_ref());
-        let mut network_port = config.user.network.backend.swarm.port;
-
-        match port_strategy {
-            PortStrategy::PreservePlannedPorts => {}
-            PortStrategy::AllocateEphemeralPorts => {
-                network_port = allocate_udp_port("network")?;
-                let blend_port = allocate_udp_port("blend")?;
-                config.user.network.backend.swarm.port = network_port;
-                config.user.blend.core.backend.listening_address =
-                    lb_libp2p::multiaddr(Ipv4Addr::LOCALHOST, blend_port);
-            }
-        }
-
-        Ok(BuiltNodeConfig {
-            config,
-            network_port,
-        })
+    fn build_node_config_from_template(
+        topology: &Self::Deployment,
+        index: usize,
+        peer_ports_by_name: &HashMap<String, u16>,
+        options: &StartNodeOptions<Self>,
+        peer_ports: &[u16],
+        template_config: Option<&<Self as Application>::NodeConfig>,
+    ) -> Result<BuiltNodeConfig<<Self as Application>::NodeConfig>, DynError> {
+        build_dynamic_node_config(
+            topology,
+            index,
+            peer_ports_by_name,
+            options,
+            peer_ports,
+            template_config,
+        )
     }
 
     fn build_initial_node_configs(
         topology: &Self::Deployment,
     ) -> Result<Vec<NodeConfigEntry<<Self as Application>::NodeConfig>>, ProcessSpawnError> {
+        register_system_monitor_output_file(
+            &topology
+                .config()
+                .scenario_base_dir
+                .join("system_stats.ndjson"),
+        );
+
         topology
             .nodes()
             .iter()
@@ -128,6 +149,13 @@ impl LocalDeployerEnv for LbcEnv {
         let mut config = config.clone();
         ensure_recovery_paths(dir).map_err(|source| -> DynError { source.into() })?;
 
+        record_system_monitor_event(
+            "node_runtime_prepared",
+            format!("{label}:{}", dir.display()),
+        );
+
+        config.user.tracing.level = configured_node_log_level();
+
         if !tf_env::debug_tracing() {
             let log_prefix = format!("{LOGS_PREFIX}-{label}");
             config.user.tracing.logger = configure_logging(dir, &log_prefix);
@@ -136,43 +164,16 @@ impl LocalDeployerEnv for LbcEnv {
         config.user.state.base_folder = dir.to_path_buf();
         "db".clone_into(&mut config.user.storage.backend.folder_name);
 
-        let config_path = dir.join("node.yaml");
-        let deployment_path = dir.join("deployment.yaml");
-
         let user_yaml = serde_yaml::to_string(&config.user).map_err(io::Error::other)?;
         let deployment_yaml =
             serde_yaml::to_string(&config.deployment).map_err(io::Error::other)?;
 
-        let time_backend =
-            env::var("LOGOS_BLOCKCHAIN_TIME_BACKEND").unwrap_or_else(|_| "monotonic".to_owned());
-
-        let binary = BinaryResolver::resolve_path(&node_binary_config());
-
-        Ok(LaunchSpec {
-            binary,
-            files: vec![
-                LaunchFile {
-                    relative_path: PathBuf::from("node.yaml"),
-                    contents: user_yaml.into_bytes(),
-                },
-                LaunchFile {
-                    relative_path: PathBuf::from("deployment.yaml"),
-                    contents: deployment_yaml.into_bytes(),
-                },
-            ],
-            args: vec![
-                config_path.to_string_lossy().to_string(),
-                "--deployment".to_owned(),
-                deployment_path.to_string_lossy().to_string(),
-            ],
-            env: vec![LaunchEnvVar::new(
-                "LOGOS_BLOCKCHAIN_TIME_BACKEND",
-                time_backend,
-            )],
-        })
+        Ok(build_node_launch_spec(dir, user_yaml, deployment_yaml))
     }
 
-    fn node_endpoints(config: &<Self as Application>::NodeConfig) -> NodeEndpoints {
+    fn node_endpoints(
+        config: &<Self as Application>::NodeConfig,
+    ) -> Result<NodeEndpoints, DynError> {
         let mut endpoints = NodeEndpoints {
             api: config.user.api.backend.listen_address,
             ..Default::default()
@@ -180,7 +181,7 @@ impl LocalDeployerEnv for LbcEnv {
 
         add_endpoint_ports(&mut endpoints, config);
 
-        endpoints
+        Ok(endpoints)
     }
 
     fn node_peer_port(node: &Node<Self>) -> u16 {
@@ -189,12 +190,12 @@ impl LocalDeployerEnv for LbcEnv {
             .unwrap_or_else(|| node.config().user.network.backend.swarm.port)
     }
 
-    fn node_client(endpoints: &NodeEndpoints) -> Self::NodeClient {
+    fn node_client(endpoints: &NodeEndpoints) -> Result<Self::NodeClient, DynError> {
         let testing_api = endpoints
             .port(&NodeEndpointPort::TestingApi)
             .map(|port| (endpoints.api.ip(), port).into());
 
-        NodeHttpClient::new(endpoints.api, testing_api)
+        Ok(NodeHttpClient::new(endpoints.api, testing_api))
     }
 
     fn readiness_endpoint_path() -> &'static str {
@@ -251,24 +252,59 @@ fn allocate_udp_port(label: &'static str) -> Result<u16, DynError> {
         })
 }
 
+fn build_node_launch_spec(dir: &Path, user_yaml: String, deployment_yaml: String) -> LaunchSpec {
+    let config_path = dir.join(USER_CONFIG_FILE);
+    let deployment_path = dir.join(DEPLOYMENT_CONFIG_FILE);
+    let time_backend =
+        env::var("LOGOS_BLOCKCHAIN_TIME_BACKEND").unwrap_or_else(|_| "monotonic".to_owned());
+
+    LaunchSpec {
+        binary: BinaryResolver::resolve_path(&node_binary_config()),
+        files: vec![
+            launch_file(USER_CONFIG_FILE, user_yaml.into_bytes()),
+            launch_file(DEPLOYMENT_CONFIG_FILE, deployment_yaml.into_bytes()),
+        ],
+        args: vec![
+            config_path.to_string_lossy().to_string(),
+            "--deployment".to_owned(),
+            deployment_path.to_string_lossy().to_string(),
+        ],
+        env: vec![LaunchEnvVar::new(
+            "LOGOS_BLOCKCHAIN_TIME_BACKEND",
+            time_backend,
+        )],
+    }
+}
+
+fn launch_file(relative_path: &str, contents: Vec<u8>) -> LaunchFile {
+    LaunchFile {
+        relative_path: PathBuf::from(relative_path),
+        contents,
+    }
+}
+
 const fn node_binary_config() -> BinaryConfig {
     BinaryConfig {
         env_var: "LOGOS_BLOCKCHAIN_NODE_BIN",
         binary_name: "logos-blockchain-node",
-        fallback_path: "target/debug/logos-blockchain-node",
+        fallback_path: concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../target/release/logos-blockchain-node"
+        ),
     }
 }
 
 fn configure_logging(base_dir: &Path, prefix: &str) -> logger::Layers {
     debug!(prefix, base_dir = %base_dir.display(), "configuring node logging");
 
-    if let Some(log_dir) = tf_env::nomos_log_dir() {
+    if let Some(log_dir) = tf_env::logos_blockchain_log_dir() {
         match fs::create_dir_all(&log_dir) {
             Ok(()) => {
                 return logger::Layers {
                     file: Some(logger::FileConfig {
                         directory: log_dir,
                         prefix: Some(prefix.into()),
+                        appender_type: AppenderType::Simple,
                     }),
                     loki: None,
                     gelf: None,
@@ -291,6 +327,7 @@ fn configure_logging(base_dir: &Path, prefix: &str) -> logger::Layers {
         file: Some(logger::FileConfig {
             directory: base_dir.to_owned(),
             prefix: Some(prefix.into()),
+            appender_type: AppenderType::Simple,
         }),
         loki: None,
         gelf: None,
@@ -300,13 +337,56 @@ fn configure_logging(base_dir: &Path, prefix: &str) -> logger::Layers {
     }
 }
 
-fn build_node_config_for(
+fn configured_node_log_level() -> Level {
+    env::var(LOGOS_BLOCKCHAIN_LOG_LEVEL)
+        .ok()
+        .and_then(|raw| raw.parse::<Level>().ok())
+        .unwrap_or(Level::INFO)
+}
+
+fn build_dynamic_node_config(
+    topology: &DeploymentPlan,
+    index: usize,
+    peer_ports_by_name: &HashMap<String, u16>,
+    options: &StartNodeOptions<LbcEnv>,
+    peer_ports: &[u16],
+    template_config: Option<&RunConfig>,
+) -> Result<BuiltNodeConfig<RunConfig>, DynError> {
+    let plan = plan_local_node_config(
+        topology,
+        index,
+        peer_ports_by_name,
+        options.peers.as_ref(),
+        peer_ports,
+    )?;
+    let mut config =
+        finalize_dynamic_run_config(&plan, options.config_override.as_ref(), template_config);
+    let mut network_port = config.user.network.backend.swarm.port;
+
+    match plan.port_strategy {
+        PortStrategy::PreservePlannedPorts => {}
+        PortStrategy::AllocateEphemeralPorts => {
+            network_port = allocate_udp_port("network")?;
+            let blend_port = allocate_udp_port("blend")?;
+            config.user.network.backend.swarm.port = network_port;
+            config.user.blend.core.backend.listening_address =
+                lb_libp2p::multiaddr(Ipv4Addr::LOCALHOST, blend_port);
+        }
+    }
+
+    Ok(BuiltNodeConfig {
+        config,
+        network_port,
+    })
+}
+
+fn plan_local_node_config(
     descriptors: &DeploymentPlan,
     index: usize,
     peer_ports_by_name: &HashMap<String, u16>,
-    peer_selection: &PeerSelection,
+    peer_selection: Option<&PeerSelection>,
     peer_ports: &[u16],
-) -> Result<BuiltNodeConfigPlan, DynError> {
+) -> Result<PlannedLocalNodeConfig, DynError> {
     let base_node = descriptors
         .nodes()
         .first()
@@ -327,12 +407,12 @@ fn build_node_config_for(
 
         config.network_config.backend.initial_peers = initial_peers;
 
-        return Ok(BuiltNodeConfigPlan {
-            node_config: config,
+        return Ok(PlannedLocalNodeConfig {
+            config,
             descriptor_override: descriptors.config().node_config_override(index).cloned(),
-            genesis_tx: descriptors
+            genesis_block: descriptors
                 .config()
-                .genesis_tx
+                .genesis_block
                 .clone()
                 .ok_or_else(|| io::Error::other("missing topology genesis tx"))?,
             port_strategy: PortStrategy::PreservePlannedPorts,
@@ -355,7 +435,7 @@ fn build_node_config_for(
         peer_ports,
     )?;
 
-    let node_config = {
+    let config = {
         let mut config = create_node_config_for_node(
             id,
             network_port,
@@ -363,6 +443,7 @@ fn build_node_config_for(
             blend_port,
             base_consensus,
             base_time,
+            descriptors.config.test_context.as_deref(),
         )
         .map_err(|source| -> DynError { source.into() })?;
 
@@ -376,12 +457,12 @@ fn build_node_config_for(
         config
     };
 
-    Ok(BuiltNodeConfigPlan {
-        node_config,
+    Ok(PlannedLocalNodeConfig {
+        config,
         descriptor_override: descriptors.config().node_config_override(index).cloned(),
-        genesis_tx: descriptors
+        genesis_block: descriptors
             .config()
-            .genesis_tx
+            .genesis_block
             .clone()
             .ok_or_else(|| io::Error::other("missing topology genesis tx"))?,
         port_strategy: PortStrategy::AllocateEphemeralPorts,
@@ -397,31 +478,36 @@ pub fn build_node_run_config(
         return Ok(override_config.clone());
     }
 
-    let genesis_tx = topology
+    let genesis_block = topology
         .config()
-        .genesis_tx
+        .genesis_block
         .clone()
         .ok_or_else(|| io::Error::other("missing topology genesis tx"))?;
-    Ok(build_run_config(node.general.clone(), genesis_tx))
+    Ok(build_run_config(node.general.clone(), &genesis_block))
 }
 
-fn build_run_config_for_dynamic(
-    built: BuiltNodeConfigPlan,
+fn finalize_dynamic_run_config(
+    plan: &PlannedLocalNodeConfig,
     runtime_override: Option<&RunConfig>,
+    template_config: Option<&RunConfig>,
 ) -> RunConfig {
     if let Some(override_config) = runtime_override {
         return override_config.clone();
     }
 
-    if let Some(override_config) = built.descriptor_override {
-        return override_config;
+    if let Some(template_config) = template_config {
+        return template_config.clone();
     }
 
-    build_run_config(built.node_config, built.genesis_tx)
+    if let Some(override_config) = &plan.descriptor_override {
+        return override_config.clone();
+    }
+
+    build_run_config(plan.config.clone(), &plan.genesis_block)
 }
 
-fn build_run_config(config: Config, genesis_tx: GenesisTx) -> RunConfig {
-    let deployment_config = default_e2e_deployment_settings(genesis_tx);
+fn build_run_config(config: Config, genesis_block: &GenesisBlock) -> RunConfig {
+    let deployment_config = default_e2e_deployment_settings(genesis_block);
 
     let user_config = UserConfig {
         network: config.network_config,
@@ -443,14 +529,14 @@ fn build_run_config(config: Config, genesis_tx: GenesisTx) -> RunConfig {
         },
         storage: storage::serde::Config::default(),
         sdp: sdp::serde::Config {
-            declaration_id: None,
+            declaration_id: config.sdp_config.declaration_id,
             wallet: sdp::serde::WalletConfig {
-                max_tx_fee: mantle::Value::MAX,
+                max_tx_fee: mantle::Value::MAX.into(),
                 funding_pk: config.consensus_config.funding_sk.as_public_key(),
             },
         },
-        wallet: wallet::serde::Config {
-            known_keys: HashMap::from_iter([
+        wallet: {
+            let known_keys: HashMap<_, _> = [
                 (
                     key_id_for_preload_backend(&Key::Zk(config.consensus_config.known_key.clone())),
                     config.consensus_config.known_key.as_public_key(),
@@ -461,10 +547,36 @@ fn build_run_config(config: Config, genesis_tx: GenesisTx) -> RunConfig {
                     )),
                     config.consensus_config.funding_sk.as_public_key(),
                 ),
-            ]),
-            voucher_master_key_id: key_id_for_preload_backend(&Key::Zk(
-                config.consensus_config.known_key.clone(),
-            )),
+            ]
+            .into_iter()
+            .chain(config.consensus_config.other_keys.iter().map(|sk| {
+                (
+                    key_id_for_preload_backend(&sk.clone().into()),
+                    sk.as_public_key(),
+                )
+            }))
+            .chain(
+                config
+                    .kms_config
+                    .backend
+                    .keys
+                    .values()
+                    .filter_map(|key| match key {
+                        Key::Zk(sk) => Some((
+                            key_id_for_preload_backend(&Key::Zk(sk.clone())),
+                            sk.as_public_key(),
+                        )),
+                        Key::Ed25519(_) => None,
+                    }),
+            )
+            .collect();
+
+            wallet::serde::Config {
+                known_keys,
+                voucher_master_key_id: key_id_for_preload_backend(&Key::Zk(
+                    config.consensus_config.known_key.clone(),
+                )),
+            }
         },
         kms: config::kms::serde::Config {
             backend: config::kms::serde::PreloadKmsBackendSettings {
@@ -504,7 +616,7 @@ fn build_cryptarchia_user_config(
             },
             sync: network::SyncConfig {
                 orphan: network::OrphanConfig {
-                    max_orphan_cache_size: NonZeroUsize::new(5)
+                    max_orphan_cache_size: NonZeroUsize::new(1000)
                         .expect("max orphan cache size must be non-zero"),
                 },
             },
@@ -513,15 +625,15 @@ fn build_cryptarchia_user_config(
             bootstrap: service::BootstrapConfig {
                 force_bootstrap: false,
                 offline_grace_period: service::OfflineGracePeriodConfig {
-                    grace_period: Duration::from_secs(20 * 60),
-                    state_recording_interval: Duration::from_secs(60),
+                    grace_period: Duration::from_mins(20),
+                    state_recording_interval: Duration::from_mins(1),
                 },
                 prolonged_bootstrap_period: consensus.prolonged_bootstrap_period,
             },
         },
         leader: LeaderConfig {
             wallet: leader::WalletConfig {
-                max_tx_fee: mantle::Value::MAX,
+                max_tx_fee: mantle::Value::MAX.into(),
                 funding_pk: consensus.funding_pk,
             },
         },
@@ -530,13 +642,13 @@ fn build_cryptarchia_user_config(
 
 fn resolve_initial_peers(
     peer_ports_by_name: &HashMap<String, u16>,
-    peer_selection: &PeerSelection,
+    peer_selection: Option<&PeerSelection>,
     default_peers: &[Multiaddr],
     descriptors: &DeploymentPlan,
     peer_ports: &[u16],
 ) -> Result<Vec<Multiaddr>, DynError> {
     match peer_selection {
-        PeerSelection::Named(names) => {
+        Some(PeerSelection::Named(names)) => {
             let mut peers = Vec::with_capacity(names.len());
             for name in names {
                 let port = peer_ports_by_name
@@ -547,7 +659,7 @@ fn resolve_initial_peers(
 
             Ok(peers)
         }
-        PeerSelection::DefaultLayout => {
+        None | Some(PeerSelection::DefaultLayout) => {
             if default_peers.is_empty() {
                 let topology: &TopologyConfig = descriptors.config();
                 Ok(initial_peers_for_dynamic_node(
@@ -558,7 +670,7 @@ fn resolve_initial_peers(
                 Ok(default_peers.to_vec())
             }
         }
-        PeerSelection::None => Ok(Vec::new()),
+        Some(PeerSelection::None) => Ok(Vec::new()),
     }
 }
 

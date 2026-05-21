@@ -9,14 +9,16 @@ use std::{
 use async_trait::async_trait;
 use lb_core::mantle::{
     MantleTx, SignedMantleTx, Transaction as _,
-    ledger::Tx as LedgerTx,
     ops::{
         Op, OpProof,
-        channel::{ChannelId, MsgId, inscribe::InscriptionOp},
+        channel::{
+            ChannelId, MsgId,
+            inscribe::{Inscription, InscriptionOp},
+        },
     },
     tx::TxHash,
 };
-use lb_key_management_system_service::keys::{Ed25519Key, ZkKey};
+use lb_key_management_system_service::keys::Ed25519Key;
 use rand::{seq::SliceRandom as _, thread_rng};
 use testing_framework_core::scenario::{
     DynError, RunContext, RunMetrics, Workload as ScenarioWorkload,
@@ -48,8 +50,6 @@ enum InscriptionWorkloadError {
     ClusterClientExhausted,
     #[error("block feed subscription closed")]
     FeedClosed,
-    #[error("failed to build ledger proof: {0}")]
-    LedgerProofBuild(String),
     #[error("failed to build signed inscription transaction: {0}")]
     SignedTransactionBuild(String),
     #[error("inscription workload confirmed {confirmed} txs; required at least {required}")]
@@ -166,7 +166,7 @@ impl<'a, E: LbcScenarioEnv + LbcBlockFeedEnv> InscriptionRunner<'a, E> {
         Ok(Self {
             channels,
             pending_by_hash: HashMap::new(),
-            feed: E::block_feed_subscription(ctx),
+            feed: E::block_feed_subscription(ctx)?,
             ctx,
             payload_bytes: workload.payload_bytes.get(),
             min_confirmed: workload.min_confirmed,
@@ -243,7 +243,6 @@ impl<'a, E: LbcScenarioEnv + LbcBlockFeedEnv> InscriptionRunner<'a, E> {
         let Some(channel) = self.channels.get_mut(channel_idx) else {
             return Ok(());
         };
-
         let (tx, msg_id, tx_hash) = build_inscription_transaction(channel, self.payload_bytes)?;
         submit_transaction_via_cluster(self.ctx, Arc::new(tx)).await?;
 
@@ -287,29 +286,31 @@ impl<'a, E: LbcScenarioEnv + LbcBlockFeedEnv> InscriptionRunner<'a, E> {
     }
 
     fn process_block(&mut self, block: &BlockRecord) {
-        for tx in block.block.transactions() {
-            let tx_hash = tx.hash();
-            let Some(channel_idx) = self.pending_by_hash.remove(&tx_hash) else {
-                continue;
-            };
+        for observed in &block.events {
+            for tx in &observed.block.transactions {
+                let tx_hash = tx.hash();
+                let Some(channel_idx) = self.pending_by_hash.remove(&tx_hash) else {
+                    continue;
+                };
 
-            let Some(channel) = self.channels.get_mut(channel_idx) else {
-                continue;
-            };
+                let Some(channel) = self.channels.get_mut(channel_idx) else {
+                    continue;
+                };
 
-            let Some(pending) = channel.pending.take() else {
-                continue;
-            };
+                let Some(pending) = channel.pending.take() else {
+                    continue;
+                };
 
-            channel.parent = pending.msg_id;
-            channel.confirmed += 1;
+                channel.parent = pending.msg_id;
+                channel.confirmed += 1;
 
-            debug!(
-                channel = ?channel.channel_id,
-                tx_hash = ?pending.tx_hash,
-                confirmation_ms = pending.submitted_at.elapsed().as_millis(),
-                "inscription transaction confirmed"
-            );
+                debug!(
+                    channel = ?channel.channel_id,
+                    tx_hash = ?pending.tx_hash,
+                    confirmation_ms = pending.submitted_at.elapsed().as_millis(),
+                    "inscription transaction confirmed"
+                );
+            }
         }
     }
 
@@ -390,34 +391,22 @@ fn build_inscription_transaction(
     };
     let msg_id = op.id();
 
-    let mantle_tx = MantleTx {
-        ops: vec![Op::ChannelInscribe(op)],
-        ledger_tx: LedgerTx::new(vec![], vec![]),
-        storage_gas_price: 0,
-        execution_gas_price: 0,
-    };
+    let mantle_tx = MantleTx([Op::ChannelInscribe(op)].into());
     let tx_hash = mantle_tx.hash();
 
     let ed25519_signature = channel
         .signing_key
         .sign_payload(tx_hash.as_signing_bytes().as_ref());
 
-    let ledger_tx_proof = ZkKey::multi_sign(&[], tx_hash.as_ref())
-        .map_err(|error| InscriptionWorkloadError::LedgerProofBuild(error.to_string()))?;
-
-    let signed_tx = SignedMantleTx::new(
-        mantle_tx,
-        vec![OpProof::Ed25519Sig(ed25519_signature)],
-        ledger_tx_proof,
-    )
-    .map_err(|error| InscriptionWorkloadError::SignedTransactionBuild(error.to_string()))?;
+    let signed_tx = SignedMantleTx::new(mantle_tx, vec![OpProof::Ed25519Sig(ed25519_signature)])
+        .map_err(|error| InscriptionWorkloadError::SignedTransactionBuild(error.to_string()))?;
 
     channel.next_nonce = channel.next_nonce.saturating_add(1);
 
     Ok((signed_tx, msg_id, tx_hash))
 }
 
-fn build_payload(channel: &ChannelState, payload_bytes: usize) -> Vec<u8> {
+fn build_payload(channel: &ChannelState, payload_bytes: usize) -> Inscription {
     let mut payload = format!(
         "tf-inscription:{:?}:{}",
         channel.channel_id, channel.next_nonce
@@ -430,7 +419,7 @@ fn build_payload(channel: &ChannelState, payload_bytes: usize) -> Vec<u8> {
         payload.truncate(payload_bytes);
     }
 
-    payload
+    Inscription::new_unchecked(payload)
 }
 
 async fn submit_transaction_via_cluster(

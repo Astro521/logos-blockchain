@@ -13,79 +13,94 @@ version     = { workspace = true }
 [lints]
 workspace = true
 
+[dev-dependencies]
+divan       = { workspace = true }
+lb-core     = { workspace = true }
+lb-groth16  = { workspace = true }
+lb-mmr      = { workspace = true }
+lb-utxotree = { workspace = true }
+
 [dependencies]
-async-trait                      = "0.1"
-cucumber                         = { features = ["output-junit"], version = "=0.22.0" }
-derivative                       = "2.2.0"
-futures                          = { default-features = false, version = "0.3" }
-futures-util                     = { default-features = false, version = "0.3.31" }
-hex                              = { default-features = false, version = "0.4.3" }
-lb-chain-broadcast-service       = { workspace = true }
+cucumber                         = { features = ["macros", "output-junit"], workspace = true }
+derivative                       = { workspace = true }
+ed25519                          = { workspace = true }
+futures                          = { workspace = true }
+futures-util                     = { workspace = true }
+hex                              = { workspace = true }
+lb-api-service                   = { workspace = true }
 lb-chain-service                 = { workspace = true }
 lb-common-http-client            = { workspace = true }
+lb-config                        = { workspace = true }
 lb-core                          = { workspace = true }
-lb-cryptarchia-engine            = { features = ["serde"], workspace = true }
 lb-groth16                       = { workspace = true }
 lb-http-api-common               = { workspace = true }
 lb-key-management-system-service = { workspace = true }
 lb-libp2p                        = { workspace = true }
-lb-network-service               = { features = ["libp2p"], workspace = true }
-lb-node                          = { default-features = false, features = ["testing"], workspace = true }
+lb-mmr                           = { workspace = true }
+lb-node                          = { features = ["testing"], workspace = true }
 lb-testing-framework             = { workspace = true }
-lb-tx-service                    = { features = ["libp2p", "mock"], workspace = true }
 lb-utils                         = { workspace = true }
-num-bigint                       = { default-features = false, version = "0.4" }
+lb-wallet                        = { workspace = true }
+lb-zksign                        = { workspace = true }
+lb-zone-sdk                      = { workspace = true }
+libp2p                           = { workspace = true }
+num-bigint                       = { workspace = true }
 rand                             = { workspace = true }
 reqwest                          = { features = ["json"], workspace = true }
-serde_json                       = "1.0"
-serde_yaml                       = "0.9"
-serial_test                      = "3.1.1"
-strum                            = "0.27.2"
-tempfile                         = { workspace = true }
+rpds                             = { workspace = true }
+serde                            = { features = ["derive"], workspace = true }
+serde_json                       = { workspace = true }
+serde_yaml                       = { workspace = true }
+serial_test                      = { workspace = true }
+strum                            = { features = ["derive", "std"], workspace = true }
+strum_macros                     = { workspace = true }
 testing-framework-core           = { workspace = true }
 testing-framework-runner-local   = { workspace = true }
-thiserror                        = { default-features = false, version = "2.0" }
-time                             = { default-features = false, version = "0.3" }
-tokio                            = "1"
+thiserror                        = { workspace = true }
+time                             = { workspace = true }
+tokio                            = { workspace = true }
 tracing                          = { workspace = true }
-tracing-subscriber               = { features = ["env-filter", "fmt"], version = "0.3" }
+tracing-subscriber               = { features = ["env-filter", "fmt"], workspace = true }
 
 [features]
 cucumber             = []
 cucumber_stand_alone = []
+mantle_sdp           = []
 testing_framework    = []
 
 [[test]]
-name = "test_blend_local_setup"
-path = "src/tests/blend/local.rs"
+name = "blend_devnet_setup"
+path = "src/tests/blend/devnet.rs"
 
 [[test]]
-name = "test_cryptarchia_happy_path"
-path = "src/tests/cryptarchia/happy.rs"
+name = "test_cli_restart"
+path = "src/tests/cli/restart.rs"
 
 [[test]]
-name = "test_cryptarchia_bootstrap"
-path = "src/tests/cryptarchia/bootstrap.rs"
+name = "test_cryptarchia_blocks_streaming"
+path = "src/tests/cryptarchia/blocks_streaming.rs"
 
 [[test]]
-name = "test_orphan_handling"
-path = "src/tests/cryptarchia/orphan.rs"
+name = "test_mantle_chain_start"
+path = "src/tests/mantle/chain_start.rs"
 
 [[test]]
-name = "test_immutable_blocks"
-path = "src/tests/cryptarchia/immutable_blocks.rs"
+name = "test_mantle_channel"
+path = "src/tests/mantle/channel.rs"
 
 [[test]]
-name = "test_invalid_tx_handling"
-path = "src/tests/cryptarchia/invalid_tx_handling.rs"
+name              = "test_mantle_sdp_ops"
+path              = "src/tests/mantle/sdp/ops.rs"
+required-features = ["mantle_sdp"]
 
 [[test]]
-name = "test_mempool_api"
-path = "src/tests/mempool/api.rs"
+name              = "test_mantle_sdp_blend"
+path              = "src/tests/mantle/sdp/activity.rs"
+required-features = ["mantle_sdp"]
 
 [[test]]
-name = "test_mantle_sdp_ops"
-path = "src/tests/mantle/sdp_ops.rs"
+name = "test_mantle_leader"
+path = "src/tests/mantle/leader.rs"
 
 [[test]]
 name              = "test_testing_framework_smoke_local"
@@ -98,8 +113,23 @@ path              = "src/tests/testing_framework/external_urls_inscription.rs"
 required-features = ["testing_framework"]
 
 [[test]]
+name              = "test_testing_framework_fork_detector"
+path              = "src/tests/testing_framework/fork_detector.rs"
+required-features = ["testing_framework"]
+
+[[test]]
+name              = "test_testing_framework_k8s_smoke"
+path              = "src/tests/testing_framework/k8s_smoke.rs"
+required-features = ["testing_framework"]
+
+[[test]]
 name              = "test_testing_framework_cucumber_smoke_local"
 path              = "cucumber_tests/stand_alone_tests/cucumber_smoke_local.rs"
+required-features = ["cucumber_stand_alone"]
+
+[[test]]
+name              = "test_testing_framework_cucumber_smoke_k8s"
+path              = "cucumber_tests/stand_alone_tests/cucumber_smoke_k8s.rs"
 required-features = ["cucumber_stand_alone"]
 
 [[test]]
@@ -107,3 +137,7 @@ harness           = false                        # Cucumber will have its own ma
 name              = "cucumber"
 path              = "cucumber_tests/cucumber.rs"
 required-features = ["cucumber"]
+
+[[bench]]
+harness = false
+name    = "voucher"

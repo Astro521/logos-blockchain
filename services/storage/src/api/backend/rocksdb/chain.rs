@@ -14,19 +14,26 @@ use rocksdb::WriteBatch;
 
 use crate::{
     api::{
-        backend::rocksdb::{Error, utils::key_bytes},
+        backend::{
+            HeaderIdStream,
+            rocksdb::{Error, utils::key_bytes},
+        },
         chain::StorageChainApi,
     },
     backends::{StorageBackend as _, rocksdb::RocksBackend},
 };
 
 const IMMUTABLE_BLOCK_PREFIX: &str = "immutable_block/slot/";
+const BLOCK_PARENT_PREFIX: &str = "block_parent/";
+const BLOCK_EVENTS_PREFIX: &str = "block_events/";
 
 #[async_trait]
 impl StorageChainApi for RocksBackend {
     type Error = Error;
     type Block = Bytes;
     type Tx = Bytes;
+    type Events = Bytes;
+
     async fn get_block(&mut self, header_id: HeaderId) -> Result<Option<Self::Block>, Self::Error> {
         let header_id: [u8; 32] = header_id.into();
         let key = Bytes::copy_from_slice(&header_id);
@@ -36,11 +43,27 @@ impl StorageChainApi for RocksBackend {
     async fn store_block(
         &mut self,
         header_id: HeaderId,
+        parent_id: HeaderId,
         block: Self::Block,
+        events: Self::Events,
     ) -> Result<(), Self::Error> {
-        let header_id: [u8; 32] = header_id.into();
-        let key = Bytes::copy_from_slice(&header_id);
-        self.store(key, block).await.map_err(Into::into)
+        let header_bytes: [u8; 32] = header_id.into();
+        let block_key = Bytes::copy_from_slice(&header_bytes);
+        let parent_key = key_bytes(BLOCK_PARENT_PREFIX, header_bytes);
+        let parent_bytes: [u8; 32] = parent_id.into();
+        let parent_value = Bytes::copy_from_slice(&parent_bytes);
+        let events_key = key_bytes(BLOCK_EVENTS_PREFIX, header_bytes);
+
+        let db_transaction = self.txn(move |db| {
+            let mut batch = WriteBatch::default();
+            batch.put(block_key, block);
+            batch.put(parent_key, parent_value);
+            batch.put(events_key, events);
+            db.write(batch)?;
+            Ok(None)
+        });
+        drop(self.execute(db_transaction).await?);
+        Ok(())
     }
 
     async fn remove_block(
@@ -48,8 +71,44 @@ impl StorageChainApi for RocksBackend {
         header_id: HeaderId,
     ) -> Result<Option<Self::Block>, Self::Error> {
         let encoded_header_id: [u8; 32] = header_id.into();
-        let key = Bytes::copy_from_slice(&encoded_header_id);
-        self.remove(&key).await.map_err(Into::into)
+        let block_key = Bytes::copy_from_slice(&encoded_header_id);
+        let parent_key = key_bytes(BLOCK_PARENT_PREFIX, encoded_header_id);
+        let events_key = key_bytes(BLOCK_EVENTS_PREFIX, encoded_header_id);
+
+        // Load the block first so we can return it.
+        let val = self.load(&block_key).await?;
+
+        let db_transaction = self.txn(move |db| {
+            let mut batch = WriteBatch::default();
+            batch.delete(block_key);
+            batch.delete(parent_key);
+            batch.delete(events_key);
+            db.write(batch)?;
+            Ok(None)
+        });
+        drop(self.execute(db_transaction).await?);
+        Ok(val)
+    }
+
+    async fn get_block_parent(
+        &mut self,
+        header_id: HeaderId,
+    ) -> Result<Option<HeaderId>, Self::Error> {
+        let header_bytes: [u8; 32] = header_id.into();
+        let key = key_bytes(BLOCK_PARENT_PREFIX, header_bytes);
+        self.load(&key)
+            .await?
+            .map(|bytes| bytes.as_ref().try_into().map_err(Into::into))
+            .transpose()
+    }
+
+    async fn get_block_events(
+        &mut self,
+        header_id: HeaderId,
+    ) -> Result<Option<Self::Events>, Self::Error> {
+        let header_bytes: [u8; 32] = header_id.into();
+        let key = key_bytes(BLOCK_EVENTS_PREFIX, header_bytes);
+        self.load(&key).await.map_err(Into::into)
     }
 
     async fn store_immutable_block_ids(
@@ -88,7 +147,7 @@ impl StorageChainApi for RocksBackend {
         &mut self,
         slot_range: RangeInclusive<Slot>,
         limit: NonZeroUsize,
-    ) -> Result<Vec<HeaderId>, Self::Error> {
+    ) -> Result<HeaderIdStream, Self::Error> {
         // use be_bytes to keep prefix ordering
         let start_key = slot_range.start().to_be_bytes();
         let end_key = slot_range.end().to_be_bytes();
@@ -101,10 +160,34 @@ impl StorageChainApi for RocksBackend {
             )
             .await?;
 
-        result
+        let mapped = result
             .into_iter()
-            .map(|bytes| bytes.as_ref().try_into().map_err(Into::into))
-            .collect::<Result<Vec<HeaderId>, Error>>()
+            .map(|bytes| bytes.as_ref().try_into().map_err(Into::into));
+
+        Ok(Box::pin(stream::iter(mapped)))
+    }
+
+    async fn scan_immutable_block_ids_reverse(
+        &mut self,
+        slot_range: RangeInclusive<Slot>,
+        limit: NonZeroUsize,
+    ) -> Result<HeaderIdStream, Self::Error> {
+        let start_key = slot_range.start().to_be_bytes();
+        let end_key = slot_range.end().to_be_bytes();
+        let result = self
+            .load_prefix_reverse(
+                IMMUTABLE_BLOCK_PREFIX.as_ref(),
+                Some(&start_key),
+                Some(&end_key),
+                Some(limit),
+            )
+            .await?;
+
+        let mapped = result
+            .into_iter()
+            .map(|bytes| bytes.as_ref().try_into().map_err(Into::into));
+
+        Ok(Box::pin(stream::iter(mapped)))
     }
 
     async fn store_transactions(
@@ -174,11 +257,15 @@ impl StorageChainApi for RocksBackend {
 mod tests {
     use std::iter;
 
-    use futures::StreamExt as _;
     use tempfile::TempDir;
 
     use super::*;
-    use crate::backends::rocksdb::RocksBackendSettings;
+    use crate::{
+        api::backend::{
+            streamed_immutable_block_ids_reverse_vec, streamed_immutable_block_ids_vec,
+        },
+        backends::rocksdb::RocksBackendSettings,
+    };
 
     #[tokio::test]
     async fn immutable_block_ids() {
@@ -210,43 +297,65 @@ mod tests {
 
         // Scan
         assert_eq!(
-            backend
-                .scan_immutable_block_ids(
-                    RangeInclusive::new(0.into(), 1.into()),
-                    NonZeroUsize::new(2).unwrap()
-                )
-                .await
-                .unwrap(),
+            streamed_immutable_block_ids_vec(
+                &mut backend,
+                RangeInclusive::new(0.into(), 1.into()),
+                NonZeroUsize::new(2).unwrap()
+            )
+            .await
+            .unwrap(),
             vec![[0u8; 32].into(), [1u8; 32].into()]
         );
         assert_eq!(
-            backend
-                .scan_immutable_block_ids(
-                    RangeInclusive::new(0.into(), 1.into()),
-                    NonZeroUsize::new(1).unwrap()
-                )
-                .await
-                .unwrap(),
+            streamed_immutable_block_ids_vec(
+                &mut backend,
+                RangeInclusive::new(0.into(), 1.into()),
+                NonZeroUsize::new(1).unwrap()
+            )
+            .await
+            .unwrap(),
             vec![[0u8; 32].into()]
         );
         assert_eq!(
-            backend
-                .scan_immutable_block_ids(
-                    RangeInclusive::new(0.into(), 0.into()),
-                    NonZeroUsize::new(2).unwrap()
-                )
-                .await
-                .unwrap(),
+            streamed_immutable_block_ids_vec(
+                &mut backend,
+                RangeInclusive::new(0.into(), 0.into()),
+                NonZeroUsize::new(2).unwrap()
+            )
+            .await
+            .unwrap(),
             vec![[0u8; 32].into()]
         );
         assert_eq!(
-            backend
-                .scan_immutable_block_ids(
-                    RangeInclusive::new(1.into(), 2.into()),
-                    NonZeroUsize::new(2).unwrap()
-                )
-                .await
-                .unwrap(),
+            streamed_immutable_block_ids_vec(
+                &mut backend,
+                RangeInclusive::new(1.into(), 2.into()),
+                NonZeroUsize::new(2).unwrap()
+            )
+            .await
+            .unwrap(),
+            vec![[1u8; 32].into()]
+        );
+
+        // Reverse scan
+        assert_eq!(
+            streamed_immutable_block_ids_reverse_vec(
+                &mut backend,
+                RangeInclusive::new(0.into(), 1.into()),
+                NonZeroUsize::new(2).unwrap()
+            )
+            .await
+            .unwrap(),
+            vec![[1u8; 32].into(), [0u8; 32].into()]
+        );
+        assert_eq!(
+            streamed_immutable_block_ids_reverse_vec(
+                &mut backend,
+                RangeInclusive::new(0.into(), 1.into()),
+                NonZeroUsize::new(1).unwrap()
+            )
+            .await
+            .unwrap(),
             vec![[1u8; 32].into()]
         );
     }

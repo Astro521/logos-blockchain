@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use lb_core::{
-    mantle::{GenesisTx as _, Note, genesis_tx::GenesisTx},
+    block::genesis::GenesisBlock,
+    mantle::{GenesisTx as _, Note},
     sdp::{Locator, ServiceType},
 };
 use lb_key_management_system_service::keys::{Key, ZkKey};
@@ -10,7 +11,7 @@ use super::{
     Config,
     node_configs::{
         blend::GeneralBlendConfig,
-        consensus::{ProviderInfo, create_genesis_tx_with_declarations},
+        consensus::{ProviderInfo, create_genesis_block_with_declarations},
     },
 };
 
@@ -30,16 +31,18 @@ pub fn leader_stake_amount(total_wallet_funds: u64, n_participants: usize) -> u6
 
 pub fn apply_wallet_genesis_overrides(
     general_configs: &mut [Config],
-    genesis_tx: &GenesisTx,
+    genesis_block: &GenesisBlock,
+    n_blend_core_nodes: usize,
     wallet_accounts: &[(ZkKey, u64)],
     key_id_for_preload_backend: impl Fn(&Key) -> String,
-) -> GenesisTx {
+    test_context: Option<&str>,
+) -> GenesisBlock {
     if wallet_accounts.is_empty() {
-        return genesis_tx.clone();
+        return genesis_block.clone();
     }
 
     if general_configs.is_empty() {
-        return genesis_tx.clone();
+        return genesis_block.clone();
     }
 
     let n_participants = general_configs.len();
@@ -57,29 +60,38 @@ pub fn apply_wallet_genesis_overrides(
         .collect::<Vec<GeneralBlendConfig>>();
 
     let mut providers = Vec::with_capacity(blend_configs.len());
-    for (idx, (blend_conf, private_key, secret_zk_key)) in blend_configs.iter().enumerate() {
+    for (idx, (blend_conf, private_key, secret_zk_key)) in
+        blend_configs.iter().enumerate().take(n_blend_core_nodes)
+    {
         providers.push(ProviderInfo {
             service_type: ServiceType::BlendNetwork,
             provider_sk: private_key.clone(),
             zk_sk: secret_zk_key.clone(),
-            locator: Locator(blend_conf.core.backend.listening_address.clone()),
+            locator: Locator::new_unchecked(blend_conf.core.backend.listening_address.clone()),
             note: general_configs[idx].consensus_config.blend_note.clone(),
         });
     }
 
-    let mut ledger_tx = genesis_tx.mantle_tx().ledger_tx.clone();
-    for output in &mut ledger_tx.outputs {
+    let mut transfer_op = genesis_block
+        .transactions()
+        .next()
+        .expect("Genesis block should have a genesis tx")
+        .genesis_transfer()
+        .clone();
+    for output in transfer_op.outputs.as_mut() {
         if leader_keys.contains(&output.pk) {
             output.value = leader_stake;
         }
     }
     for (secret_key, value) in wallet_accounts {
-        ledger_tx
+        transfer_op
             .outputs
+            .as_mut()
             .push(Note::new(*value, secret_key.to_public_key()));
     }
 
-    let genesis_tx = create_genesis_tx_with_declarations(ledger_tx, providers);
+    let genesis_block =
+        create_genesis_block_with_declarations(transfer_op, providers, test_context);
 
     for general in general_configs.iter_mut() {
         for (secret_key, _) in wallet_accounts {
@@ -89,5 +101,5 @@ pub fn apply_wallet_genesis_overrides(
         }
     }
 
-    genesis_tx
+    genesis_block
 }

@@ -65,10 +65,10 @@ impl BlockStream {
                         ).dimmed());
 
                         let block = http_client.get_block_by_id(endpoint_url.clone(), header_id).await.unwrap().unwrap();
-                        for (l2_block, l1_transaction_id) in extract_l2_blocks(block.transactions().cloned(), channel_id, token_name) {
+                        for (l2_block, l1_transaction_id) in extract_l2_blocks(block.transactions.iter().cloned(), channel_id, token_name) {
                             yield L2BlockInfo {
                                 data: l2_block,
-                                l1_block_id: block.header().id(),
+                                l1_block_id: block.header.id,
                                 l1_transaction_id,
                             };
                         }
@@ -90,7 +90,7 @@ fn extract_l2_blocks(
         .flat_map(|tx| {
             let tx_hash = tx.mantle_tx.hash();
             tx.mantle_tx
-                .ops
+                .0
                 .iter()
                 .filter_map(|op| match op {
                     Op::ChannelInscribe(InscriptionOp {

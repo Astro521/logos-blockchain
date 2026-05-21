@@ -4,33 +4,11 @@ use std::{
     str::FromStr as _,
 };
 
-use lb_node::config::InitArgs;
+use lb_node::cli::InitArgs;
 use multiaddr::Multiaddr;
 use tokio::runtime::Runtime;
 
-use crate::OperationStatus;
-
-#[repr(C)]
-pub enum DeploymentType {
-    WellKnown = 0,
-    Custom = 1,
-}
-
-#[repr(C)]
-pub enum WellKnownDeployment {
-    Devnet = 0,
-}
-
-#[repr(C)]
-pub struct Deployment {
-    pub deployment_type: DeploymentType,
-
-    // Only valid if deployment_type is WellKnown.
-    pub well_known_deployment: WellKnownDeployment,
-
-    // Only valid if deployment_type is Custom.
-    pub custom_deployment_config_path: *const c_char,
-}
+use crate::{OperationStatus, api::types::config::Deployment};
 
 #[repr(C)]
 pub struct GenerateConfigArgs {
@@ -103,36 +81,6 @@ impl From<GenerateConfigArgs> for InitArgs {
             init_args.external_address = external_address.to_string_lossy().parse().ok();
         }
 
-        // ---- no_public_ip_check ----
-        if !value.no_public_ip_check.is_null() {
-            init_args.no_public_ip_check = unsafe { *value.no_public_ip_check };
-        }
-
-        // ---- deployment ----
-        if !value.deployment.is_null() {
-            let deployment = unsafe { &*value.deployment };
-
-            match deployment.deployment_type {
-                DeploymentType::WellKnown => {
-                    init_args.deployment = match deployment.well_known_deployment {
-                        WellKnownDeployment::Devnet => lb_node::config::DeploymentType::WellKnown(
-                            lb_node::config::WellKnownDeployment::Devnet,
-                        ),
-                    };
-                }
-                DeploymentType::Custom => {
-                    if !deployment.custom_deployment_config_path.is_null() {
-                        let config_path =
-                            unsafe { CStr::from_ptr(deployment.custom_deployment_config_path) };
-                        let config_path = config_path.to_string_lossy().into_owned();
-
-                        init_args.deployment =
-                            lb_node::config::DeploymentType::Custom(config_path.into());
-                    }
-                }
-            }
-        }
-
         // ---- state_path ----
         if !value.state_path.is_null() {
             let state_path = unsafe { CStr::from_ptr(value.state_path) };
@@ -146,7 +94,7 @@ impl From<GenerateConfigArgs> for InitArgs {
 #[must_use]
 pub fn generate_config_sync(args: InitArgs) -> OperationStatus {
     let runtime = Runtime::new().expect("Failed to create Tokio runtime.");
-    let run_result = runtime.block_on(async move { lb_node::init::run(&args).await });
+    let run_result = runtime.block_on(async move { lb_node::cli::init::run(&args) });
     match run_result {
         Ok(()) => OperationStatus::Ok,
         Err(error) => {
@@ -160,12 +108,12 @@ pub fn generate_config_sync(args: InitArgs) -> OperationStatus {
 ///
 /// # Arguments
 ///
-/// * `args` - A [`GenerateConfigArgs`] struct containing the arguments to be
+/// - `args`: A [`GenerateConfigArgs`] struct containing the arguments to be
 ///   used for generating the config file.
 ///
 /// # Returns
 ///
-/// An `OperationStatus` indicating the result of the operation.
+/// An [`OperationStatus`] indicating the result of the operation.
 ///
 /// # Safety
 ///

@@ -2,6 +2,7 @@ use std::fmt::{Debug, Display};
 
 use async_trait::async_trait;
 use backends::NetworkBackend;
+use lb_log_targets::network_service;
 use overwatch::{
     OpaqueServiceResourcesHandle,
     services::{
@@ -15,6 +16,9 @@ use crate::{config::NetworkConfig, message::BackendNetworkMsg};
 pub mod backends;
 pub mod config;
 pub mod message;
+mod metrics;
+
+const LOG_TARGET: &str = network_service::ROOT;
 
 pub struct NetworkService<Backend, RuntimeServiceId>
 where
@@ -69,6 +73,7 @@ where
 
         self.service_resources_handle.status_updater.notify_ready();
         tracing::info!(
+            target: LOG_TARGET,
             "Service '{}' is ready.",
             <RuntimeServiceId as AsServiceId<Self>>::SERVICE_ID
         );
@@ -100,6 +105,7 @@ where
                 .send(backend.subscribe_to_pubsub().await)
                 .unwrap_or_else(|_| {
                     tracing::warn!(
+                        target: LOG_TARGET,
                         "client hung up before a subscription handle could be established"
                     );
                 }),
@@ -107,6 +113,7 @@ where
                 .send(backend.subscribe_to_chainsync().await)
                 .unwrap_or_else(|_| {
                     tracing::warn!(
+                        target: LOG_TARGET,
                         "client hung up before a subscription handle could be established"
                     );
                 }),

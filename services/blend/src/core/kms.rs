@@ -10,13 +10,14 @@ use lb_key_management_system_service::{
     api::KmsServiceApi, backend::preload::KeyId, keys::KeyOperators,
     operators::blend::poq::PoQOperator,
 };
+use lb_log_targets::blend;
 use lb_poq::CorePathAndSelectors;
 use overwatch::services::AsServiceId;
 use tokio::sync::oneshot;
 
 use crate::kms::PreloadKmsService;
 
-const LOG_TARGET: &str = "blend::service::core::kms-poq-generator";
+const LOG_TARGET: &str = blend::service::core::KMS_POQ_GENERATOR;
 
 #[async_trait]
 pub trait KmsPoQAdapter<RuntimeServiceId> {
@@ -47,7 +48,10 @@ impl<RuntimeServiceId> KmsPoQAdapter<RuntimeServiceId>
         key_id: Self::KeyId,
         core_path_and_selectors: Box<CorePathAndSelectors>,
     ) -> Self::CorePoQGenerator {
-        tracing::debug!(target: LOG_TARGET, "Creating KMS-based PoQ generator with key ID {key_id:?} and core path and selectors {core_path_and_selectors:?}");
+        tracing::trace!(
+            target: LOG_TARGET,
+            "Creating KMS-based PoQ generator with key ID {key_id:?} and core path and selectors {core_path_and_selectors:?}"
+        );
         PreloadKMSBackendCorePoQGenerator {
             core_path_and_selectors: *core_path_and_selectors,
             kms_api: self.clone(),
@@ -75,7 +79,10 @@ where
         key_index: u64,
     ) -> impl Future<Output = Result<(VerifiedProofOfQuota, ZkHash), quota::Error>> + Send + Sync
     {
-        tracing::debug!(target: LOG_TARGET, "Generating KMS-based PoQ with public_inputs {public_inputs:?} and key_index {key_index:?}.");
+        tracing::trace!(
+            target: LOG_TARGET,
+            "Generating KMS-based PoQ with public_inputs {public_inputs:?} and key_index {key_index:?}."
+        );
 
         let kms_api = self.kms_api.clone();
         let key_id = self.key_id.clone();
@@ -97,7 +104,7 @@ where
             let poq = res_receiver
                 .await
                 .expect("Should not fail to get PoQ generation result from KMS.")?;
-            tracing::debug!(target: LOG_TARGET, "KMS-based PoQ generation succeeded.");
+            tracing::trace!(target: LOG_TARGET, "KMS-based PoQ generation succeeded.");
             Ok(poq)
         }
     }

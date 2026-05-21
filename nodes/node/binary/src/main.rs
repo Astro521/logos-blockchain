@@ -2,26 +2,34 @@ use clap::Parser as _;
 use color_eyre::eyre::{Result, eyre};
 use logos_blockchain_node::{
     UserConfig,
+    cli::{CliArgs, Command, build_run_config},
     config::{
-        CliArgs, DeploymentType, OnUnknownKeys, deployment::DeploymentSettings,
-        deserialize_config_at_path,
+        DeploymentType, OnUnknownKeys, deployment::DeploymentSettings, deserialize_config_at_path,
     },
     get_services_to_start, run_node_from_config,
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    #[cfg(feature = "dhat-heap")]
+    let _dhat_drop_guard = logos_blockchain_node::global_allocators::dhat_heap::setup();
+
     let cli_args = CliArgs::parse();
 
     if let Some(command) = cli_args.command {
         match command {
-            #[cfg(feature = "config-gen")]
-            logos_blockchain_node::config::Command::Init(init_args) => {
-                return logos_blockchain_node::init::run(&init_args).await;
+            Command::Init(init_args) => {
+                return logos_blockchain_node::cli::init::run(&init_args);
             }
-            logos_blockchain_node::config::Command::Inscribe(inscribe_args) => {
-                logos_blockchain_tui_zone::run(inscribe_args).await;
+            Command::Inscribe(inscribe_args) => {
+                lb_tui_zone::run(inscribe_args).await;
                 return Ok(());
+            }
+            Command::Participate(participate_args) => {
+                return logos_blockchain_node::cli::participate::run(&participate_args);
+            }
+            Command::GetPeerId(get_peer_id_args) => {
+                return logos_blockchain_node::cli::get_peer_id::run(&get_peer_id_args);
             }
         }
     }
@@ -56,14 +64,29 @@ async fn main() -> Result<()> {
 
     let run_config = {
         let user_config =
-            deserialize_config_at_path::<UserConfig>(cli_args.config_path(), OnUnknownKeys::Warn)?;
-        user_config.update_from_args(cli_args)?
+            deserialize_config_at_path::<UserConfig>(cli_args.config_path(), OnUnknownKeys::Warn)
+                .inspect_err(|e| {
+                eprintln!("\nExiting... {e}.\n");
+            })?;
+        build_run_config(user_config, cli_args)?
     };
 
-    let app = run_node_from_config(run_config).map_err(|e| eyre!("{e}"))?;
-    let services_to_start = get_services_to_start(&app).await?;
+    let app = run_node_from_config(run_config, None)
+        .map_err(|e| eyre!("{e}"))
+        .inspect_err(|e| {
+            eprintln!("\nExiting... {e}.\n");
+        })?;
+    let services_to_start = get_services_to_start(&app).await.inspect_err(|e| {
+        eprintln!("\nExiting... {e}.\n");
+    })?;
 
-    drop(app.handle().start_service_sequence(services_to_start).await);
+    app.handle()
+        .start_service_sequence(services_to_start)
+        .await
+        .map_err(|e| eyre!("start_service_sequence failed: {e}"))
+        .inspect_err(|e| {
+            eprintln!("\nExiting... {e}.\n");
+        })?;
 
     app.wait_finished().await;
     Ok(())

@@ -1,10 +1,16 @@
 pub mod blend;
+pub mod locked_notes;
 
-use std::hash::Hash;
+use core::{
+    iter::{Chain, Once, once},
+    slice,
+    str::FromStr,
+};
+use std::{hash::Hash, vec};
 
 use blake2::{Blake2b, Digest as _};
 use lb_key_management_system_keys::keys::ZkPublicKey;
-use multiaddr::Multiaddr;
+use multiaddr::{Multiaddr, Protocol};
 use nom::{IResult, Parser as _, bytes::complete::take};
 use serde::{Deserialize, Serialize};
 use strum::EnumIter;
@@ -12,7 +18,7 @@ use strum::EnumIter;
 use crate::{
     block::BlockNumber,
     mantle::{NoteId, ops::channel::Ed25519PublicKey},
-    utils::serde_bytes_newtype,
+    utils::{display_hex_bytes_newtype, serde_bytes_newtype},
 };
 
 pub type SessionNumber = u64;
@@ -43,19 +49,125 @@ impl ServiceParameters {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct Locator(pub Multiaddr);
+#[serde(into = "Vec<Locator>", try_from = "Vec<Locator>")]
+pub struct Locators(Locator, Vec<Locator>);
+
+impl Locators {
+    #[must_use]
+    pub const fn first(&self) -> &Locator {
+        &self.0
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        1 + self.1.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &Locator> {
+        self.into_iter()
+    }
+}
+
+impl From<Locator> for Locators {
+    fn from(locator: Locator) -> Self {
+        Self(locator, vec![])
+    }
+}
+
+impl From<Locators> for Vec<Locator> {
+    fn from(locators: Locators) -> Self {
+        once(locators.0).chain(locators.1).collect()
+    }
+}
+
+impl TryFrom<Vec<Locator>> for Locators {
+    type Error = String;
+
+    fn try_from(mut value: Vec<Locator>) -> Result<Self, Self::Error> {
+        if value.is_empty() {
+            return Err("At least one locator is required".to_owned());
+        }
+
+        let rest = value.split_off(1);
+
+        Ok(Self(value.pop().unwrap(), rest))
+    }
+}
+
+impl<'a> IntoIterator for &'a Locators {
+    type Item = &'a Locator;
+    type IntoIter = Chain<Once<&'a Locator>, slice::Iter<'a, Locator>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        once(&self.0).chain(self.1.iter())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "Multiaddr")]
+pub struct Locator(Multiaddr);
 
 impl Locator {
     #[must_use]
-    pub const fn new(addr: Multiaddr) -> Self {
+    pub const fn new_unchecked(addr: Multiaddr) -> Self {
         Self(addr)
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> Multiaddr {
+        self.0
     }
 }
 
 impl AsRef<Multiaddr> for Locator {
     fn as_ref(&self) -> &Multiaddr {
         &self.0
+    }
+}
+
+impl TryFrom<Multiaddr> for Locator {
+    type Error = String;
+
+    fn try_from(value: Multiaddr) -> Result<Self, Self::Error> {
+        for protocol in &value {
+            match protocol {
+                Protocol::Ip4(ip) if ip.is_unspecified() => {
+                    return Err(format!(
+                        "Locator multiaddr must not contain an unspecified IPv4 address: {value}"
+                    ));
+                }
+                Protocol::Ip6(ip) if ip.is_unspecified() => {
+                    return Err(format!(
+                        "Locator multiaddr must not contain an unspecified IPv6 address: {value}"
+                    ));
+                }
+                Protocol::P2p(_) => {
+                    return Err(format!(
+                        "Locator multiaddr must not contain a peer ID: {value}"
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self(value))
+    }
+}
+
+impl FromStr for Locator {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let multiaddr = s
+            .parse::<Multiaddr>()
+            .map_err(|e| format!("Invalid multiaddr: {e}"))?;
+        println!("Multiaddr: {multiaddr}");
+        Self::try_from(multiaddr)
     }
 }
 
@@ -89,6 +201,12 @@ pub struct ProviderId(pub Ed25519PublicKey);
 #[derive(Debug)]
 pub struct InvalidKeyBytesError;
 
+impl From<Ed25519PublicKey> for ProviderId {
+    fn from(pk: Ed25519PublicKey) -> Self {
+        Self(pk)
+    }
+}
+
 impl TryFrom<[u8; 32]> for ProviderId {
     type Error = InvalidKeyBytesError;
 
@@ -114,17 +232,14 @@ impl Ord for ProviderId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub struct DeclarationId(pub [u8; 32]);
 serde_bytes_newtype!(DeclarationId, 32);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ActivityId(pub [u8; 32]);
+display_hex_bytes_newtype!(DeclarationId);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Declaration {
     pub service_type: ServiceType,
     pub provider_id: ProviderId,
     pub locked_note_id: NoteId,
-    pub locators: Vec<Locator>,
+    pub locators: Locators,
     pub zk_id: ZkPublicKey,
     pub created: BlockNumber,
     pub active: BlockNumber,
@@ -134,7 +249,7 @@ pub struct Declaration {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderInfo {
-    pub locators: Vec<Locator>,
+    pub locators: Locators,
     pub zk_id: ZkPublicKey,
 }
 
@@ -158,7 +273,7 @@ impl Declaration {
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct DeclarationMessage {
     pub service_type: ServiceType,
-    pub locators: Vec<Locator>,
+    pub locators: Locators,
     pub provider_id: ProviderId,
     pub zk_id: ZkPublicKey,
     pub locked_note_id: NoteId,
@@ -261,6 +376,69 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Unknown metadata type")
+        );
+    }
+
+    #[test]
+    fn locator_rejects_multiaddr_with_peer_id() {
+        assert!("/ip4/65.109.51.37/udp/3000/quic-v1/p2p/12D3KooWL7a8LBbLRYnabptHPFBCmAs49Y7cVMqvzuSdd43tAJk8".parse::<Locator>().unwrap_err().contains("must not contain a peer ID"));
+    }
+
+    #[test]
+    fn locator_rejects_multiaddr_with_unspecified_ipv4() {
+        assert!(
+            "/ip4/0.0.0.0/udp/3000/quic-v1"
+                .parse::<Locator>()
+                .unwrap_err()
+                .contains("must not contain an unspecified IPv4 address")
+        );
+    }
+
+    #[test]
+    fn locator_rejects_multiaddr_with_unspecified_ipv6() {
+        assert!(
+            "/ip6/::/udp/3000/quic-v1"
+                .parse::<Locator>()
+                .unwrap_err()
+                .contains("must not contain an unspecified IPv6 address")
+        );
+    }
+
+    #[test]
+    fn locator_accepts_specific_ip_without_peer_id() {
+        let addr: Multiaddr = "/ip4/127.0.0.1/udp/3000/quic-v1".parse().unwrap();
+
+        let result = Locator::try_from(addr.clone()).unwrap();
+
+        assert_eq!(result.into_inner(), addr);
+    }
+
+    #[test]
+    fn locators_array_serde_equivalence() {
+        let locator: Locator = "/ip4/127.0.0.1/udp/3001/quic-v1".parse().unwrap();
+
+        let locator_vector_serialized = serde_json::to_string(&vec![locator.clone()]).unwrap();
+        let locators_serialized = serde_json::to_string(&Locators::from(locator.clone())).unwrap();
+
+        assert_eq!(locator_vector_serialized, locators_serialized);
+
+        let locator_vectors_deserialized_as_locators =
+            serde_json::from_str::<Locators>(&locator_vector_serialized).unwrap();
+        assert_eq!(
+            locator_vectors_deserialized_as_locators,
+            Locators::from(locator)
+        );
+    }
+
+    #[test]
+    fn empty_locators_fail_to_deserialize() {
+        let empty_locators = Vec::<Locator>::new();
+        let serialized = serde_json::to_string(&empty_locators).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Locators>(&serialized)
+                .unwrap_err()
+                .to_string(),
+            "At least one locator is required"
         );
     }
 }

@@ -4,9 +4,9 @@ use std::{
 };
 
 use futures::{Stream, StreamExt as _};
-use tracing::debug;
+use lb_log_targets::blend;
 
-const LOG_TARGET: &str = "blend::network::core::core::conn::maintenance";
+const LOG_TARGET: &str = blend::network::core::core::conn::MAINTENANCE;
 
 /// Counts the number of messages received from a peer during
 /// an interval.
@@ -89,7 +89,10 @@ where
         };
         // First tick is used to set the range for the new observation window.
         if self.expected_message_range.is_none() {
-            debug!(target: LOG_TARGET, "First tick received. Starting monitoring connection from now on at every tick...");
+            tracing::trace!(
+                target: LOG_TARGET,
+                "first monitor tick received; starting periodic connection monitoring"
+            );
             self.reset(new_expected_message_count_range);
             cx.waker().wake_by_ref();
             return Poll::Pending;
@@ -101,7 +104,13 @@ where
         } else {
             ConnectionMonitorOutput::Healthy
         };
-        debug!(target: LOG_TARGET, "Monitor clock. Received messages = {:#?}, expected range = {:#?} -> Outcome = {outcome:?}.", self.current_window_message_count, self.expected_message_range);
+        tracing::trace!(
+            target: LOG_TARGET,
+            received_messages = self.current_window_message_count,
+            expected_range = ?self.expected_message_range,
+            outcome = ?outcome,
+            "connection monitor tick"
+        );
         self.reset(new_expected_message_count_range);
         Poll::Ready(Some(outcome))
     }

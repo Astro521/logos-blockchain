@@ -1,38 +1,138 @@
-## Setup
+## 🚀 Quick Start
 
-If it's the first time configuring your environment, please do the following:
+### 📦 Prerequisites
 
-1. From the artifacts, download and unzip the circuits for your architecture.
-2. Set the `LOGOS_BLOCKCHAIN_CIRCUITS` variable to the folder containing the circuits.
+1. Download and unzip the **circuits** for your architecture from the release artifacts.
+2. Rename the downloaded `logos-blockchain-circuits` to `.logos-blockchain-circuits` and move it to your home directory:
 
-To run the binary, you will need to create a node config.
+   ```bash
+    mv logos-blockchain-circuits ~/.logos-blockchain-circuits
+   ```
 
-### Config generation
+3. Download and unzip the **node binary** for your architecture:
 
-Check the [Notion page][release-notion] for info about how to connect your node to the devnet!
+   ```bash
+    tar -xzf logos-blockchain-node-<arch>-<version>.tar.gz
+   ```
 
-## Run the binary
+### ⚙️ Initialize Your Node
 
-After generating the node config file to fit your needs, you can untar and run the node binary.
+Generate a default configuration by connecting to the bootstrap peers:
 
-To untar the binary, run:
+```bash
+./logos-blockchain-node init \
+    -p /ip4/65.108.203.235/udp/3000/quic-v1/p2p/{TODO} \
+    -p /ip4/65.108.203.235/udp/3001/quic-v1/p2p/{TODO} \
+    -p /ip4/65.108.203.235/udp/3002/quic-v1/p2p/{TODO} \
+    -p /ip4/65.108.203.235/udp/3003/quic-v1/p2p/{TODO}
+```
 
-`tar -xzf logos-blockchain-node-{your_architecture}-{binary_version}.tar.gz`, for instance `tar -xzf logos-blockchain-node-macos-aarch64-0.0.1.tar.gz`.
+If your node has a known public IP address and you want to disable NAT traversal, you can add `--external-address /ip4/<public-ip>/udp/<port>/quic-v1` to the previous command. Nodes behind NAT or CG-NAT require no extra flags — NAT traversal is enabled by default.
 
-The operation will give you the `logos-blockchain-node` binary, which you can now run. See the repo's `README.md` for more info.
+This takes a few seconds and produces a `user_config.yaml` file.
 
-To verify that your node is running correctly and connected, visit `http://localhost:{api_port_in_user_config}/cryptarchia/info`. The slot and height should both be constantly increasing.
+### ▶️ Run Your Node
 
-You can compare your consensus state with any nodes of the Logos Blockchain fleet reachable at [https://devnet.blockchain.logos.co/web/](https://devnet.blockchain.logos.co/web/) by checking their cryptarchia info.
+Run the node:
 
-## Checklist
+```bash
+./logos-blockchain-node user_config.yaml
+```
 
-Before publishing please ensure:
-- [ ] Description is complete
-- [ ] Auto-generate the changelog (GH feature) by selecting the tag corresponding to the previous release. GH will add the changelog to the end of the release notes. Move the whole section at the top of the release notes instead
-- [ ] Verify binaries for Mac and Linux platforms are present
-- [ ] Verify circuits of the expected version for Mac and Linux platforms are present
-- [ ] Check either the pre-release or "latest" checkbox, depending on the type of release
-- [ ] Remove this checklist once fully addressed and publish the release
+The node writes rotating log files (one per hour).
+
+### ✅ Verify It Works
+
+Check your local consensus state by querying your node's API, by default listening on port `8080`:
+
+```
+curl -w "\n" http://localhost:8080/cryptarchia/info
+```
+
+Your node should be in `Bootstrapping` mode for a few minutes, with both `slot` and `height` steadily increasing.
+
+After bootstrapping is complete, your node will move to `Online` mode.
+If you have joined the devnet, you can compare against the fleet nodes at the [Logos devnet dashboard][devnet-dashboard].
+For testnet, you can check the [Logos testnet dashboard][testnet-dashboard].
+
+---
+
+## 💰 Getting Funds
+
+**1. 🔑 Find your wallet key**
+
+```bash
+grep -A3 known_keys user_config.yaml
+```
+
+Copy any of the listed key IDs. For example:
+
+```yaml
+known_keys:
+    af391a0d7v29e5f7ca28281eca974146689f8f1c9b712380c07089dabcb60a8c: ...
+    de3233cec107e6589f83d4f3094caa65c633b5b33601211353779dc01972ca14: ...
+```
+
+Either key can be used.
+
+**2. 🚰 Request funds from the faucet**
+
+Visit the [devnet faucet][devnet-faucet] or [testnet faucet][testnet-faucet] and enter the credentials provided by the Logos Blockchain team (you can reach out to them on [Discord][testnet-discord-public]), then paste your wallet key.
+
+A word of caution - do not _powerclick_ your way through as only one request can be made per block! So if you want to receive funds more than once, wait until your balance increases before requesting new funds.
+
+**3. 💸 Confirm your balance**
+
+Wait 1-2 minutes for the transaction to land in a block, then:
+
+```bash
+curl -w "\n" http://localhost:8080/wallet/<my_key>/balance
+```
+
+Replace `<my_key>` with the key ID you funded.
+
+---
+
+## 🧱 Proposing Blocks
+
+Approximately 3.5h (two epochs) after you receive funds from the faucet, your node will automatically start producing blocks. 🎉
+
+---
+
+## 📝 Inscribing
+
+Start publishing messages to the blockchain using the built in text sequencer:
+
+```bash
+./logos-blockchain-node inscribe
+```
+
+---
+
+## 🛟 Troubleshooting
+
+Having issues? Reach out to the Logos Blockchain team on [Discord][testnet-discord-public] or check the [testnet Notion page][release-notion] for FAQs and up-to-date instructions.
+
+---
+
+## [REMOVE BEFORE PUBLISHING] Release Checklist
+
+> **Internal — remove this section before publishing.**
+
+- [ ] Generate the changelog (GitHub feature) using the tag of the previous release.
+    * If this is the first release candidate, then the previous tag is the version of the latest release, e.g. `0.1.3-rc.1` compares against `0.1.2`
+    * If this is a release candidate but not the first one that has a GH release, then the previous tag is the version of previous release candidate for this release, e.g., `0.1.3-rc.2` compares against `0.1.3-rc.1`
+    * If this is an actual release, then the previous tag is the latest release, e.g., `0.1.3` compares against `0.1.2`
+- [ ] Verify binaries are present for **Mac** and **Linux**
+- [ ] Verify circuits of the expected version are present for **Mac** and **Linux**
+- [ ] Replace `{TODO}` peer IDs:
+    * For a release candidate (for devnet), copy-paste the new devnet addresses from the [devnet dashboard][devnet-dashboard]
+    * For a release (for testnet), copy-paste the new testnet addresses from the [testnet dashboard][testnet-dashboard]
+- [ ] Delete this checklist and publish
 
 [release-notion]: https://www.notion.so/nomos-tech/Internal-Devnet-Launch-February-2026-2fe261aa09df8025ad94e380933b4cf9#2ff261aa09df8058935ecb85aa587564
+[testnet-faucet]: https://testnet.blockchain.logos.co/web/faucet/
+[devnet-faucet]: https://devnet.blockchain.logos.co/web/faucet/
+[testnet-dashboard]: https://testnet.blockchain.logos.co/web/
+[devnet-dashboard]: https://devnet.blockchain.logos.co/web/
+[testnet-discord-public]: https://discord.com/channels/973324189794697286/1468535289604735038

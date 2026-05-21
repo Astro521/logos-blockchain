@@ -6,11 +6,12 @@ use core::{
 use std::num::{NonZeroU64, NonZeroU128};
 
 use futures::{Stream, StreamExt as _};
-use tracing::{debug, trace};
+use lb_log_targets::blend;
+use tracing::trace;
 
 use crate::message_scheduler::round_info::Round;
 
-const LOG_TARGET: &str = "blend::scheduling::delay";
+const LOG_TARGET: &str = blend::scheduling::DELAY;
 
 /// A scheduler for delaying processed messages and batch them into release
 /// rounds, as per the specification.
@@ -42,7 +43,7 @@ where
         mut rng: Rng,
         round_clock: RoundClock,
     ) -> Self {
-        debug!(target: LOG_TARGET, "Creating new release delayer with {maximum_release_delay_in_rounds} maximum delay (in rounds).");
+        trace!(target: LOG_TARGET, "Creating new release delayer with {maximum_release_delay_in_rounds} maximum delay (in rounds).");
 
         let next_release_round =
             schedule_next_release_round_offset(maximum_release_delay_in_rounds, &mut rng);
@@ -85,7 +86,7 @@ impl<RoundClock, Rng, ProcessedMessage>
     /// along with any other queued message.
     pub fn schedule_message(&mut self, message: ProcessedMessage) {
         self.unreleased_messages.push(message);
-        debug!(target: LOG_TARGET, "New message scheduled. Pending message count: {}", self.unreleased_messages.len());
+        trace!(target: LOG_TARGET, "New message scheduled. Pending message count: {}", self.unreleased_messages.len());
     }
 
     /// Get a reference to the stored rng.
@@ -141,7 +142,7 @@ where
         };
 
         // If it's time to release messages...
-        if new_round == self.next_release_round {
+        if new_round >= self.next_release_round {
             // Reset the next release round.
             self.next_release_round = calculate_next_release_round(
                 new_round,
@@ -150,7 +151,7 @@ where
             );
             // Return the unreleased messages and clear the buffer.
             let messages = mem::take(&mut self.unreleased_messages);
-            debug!(target: LOG_TARGET, "Round {new_round} is a release round.");
+            trace!(target: LOG_TARGET, "Round {new_round} is a release round.");
             return Poll::Ready(Some(messages));
         }
         trace!(target: LOG_TARGET, "Round {new_round} is not a release round.");

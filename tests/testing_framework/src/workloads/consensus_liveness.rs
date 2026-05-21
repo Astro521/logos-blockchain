@@ -2,6 +2,7 @@ use std::{marker::PhantomData, time::Duration};
 
 use async_trait::async_trait;
 use futures::future::join_all;
+use lb_chain_service::ChainServiceInfo;
 use testing_framework_core::scenario::{DynError, Expectation, RunContext};
 use thiserror::Error;
 use tokio::time::sleep;
@@ -50,6 +51,10 @@ where
 
         let check = Self::collect_results_with_progress(ctx).await;
         self.report(target_hint, check)
+    }
+
+    async fn check_during_capture(&mut self, ctx: &RunContext<E>) -> Result<(), DynError> {
+        Self::ensure_participants(ctx)
     }
 }
 
@@ -193,10 +198,14 @@ where
         client
             .consensus_info()
             .await
-            .map(|info| ConsensusInfoSample {
-                height: info.height,
-                tip: format!("{:?}", info.tip),
-            })
+            .map(
+                |ChainServiceInfo {
+                     cryptarchia_info, ..
+                 }| ConsensusInfoSample {
+                    height: cryptarchia_info.height,
+                    tip: format!("{:?}", cryptarchia_info.tip),
+                },
+            )
             .map_err(Into::into)
     }
 

@@ -6,11 +6,12 @@ use axum::{
         HeaderValue,
         header::{CONTENT_TYPE, USER_AGENT},
     },
-    routing::get,
+    routing::{get, post},
 };
+use http::StatusCode;
 use lb_api_service::Backend;
-use lb_http_api_common::paths::MANTLE_SDP_DECLARATIONS;
-pub use lb_network_service::backends::libp2p::Libp2p as NetworkBackend;
+use lb_http_api_common::paths::{DIAL_PEER, MANTLE_SDP_DECLARATIONS};
+use lb_network_service::{NetworkService, backends::libp2p::Libp2p as NetworkBackend};
 use overwatch::{overwatch::handle::OverwatchHandle, services::AsServiceId};
 use tokio::net::TcpListener;
 use tower::limit::ConcurrencyLimitLayer;
@@ -18,11 +19,15 @@ use tower_http::{
     cors::{Any, CorsLayer},
     limit::RequestBodyLimitLayer,
     timeout::TimeoutLayer,
-    trace::TraceLayer,
+    trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer},
 };
+use tracing::Level as TracingLevel;
 
 use crate::{
-    api::{backend::AxumBackendSettings, testing::handlers::get_sdp_declarations},
+    api::{
+        backend::AxumBackendSettings,
+        testing::handlers::{dial_peer, get_sdp_declarations},
+    },
     generic_services::{self, SdpService},
 };
 pub struct TestAxumBackend {
@@ -44,6 +49,7 @@ where
         + Debug
         + Clone
         + 'static
+        + AsServiceId<NetworkService<NetworkBackend, RuntimeServiceId>>
         + AsServiceId<TestCryptarchiaService<RuntimeServiceId>>
         + AsServiceId<TestHttpCryptarchiaService<RuntimeServiceId>>
         + AsServiceId<SdpService<RuntimeServiceId>>
@@ -80,16 +86,24 @@ where
                 MANTLE_SDP_DECLARATIONS,
                 get(get_sdp_declarations::<RuntimeServiceId>),
             )
+            .route(DIAL_PEER, post(dial_peer::<RuntimeServiceId>))
             .with_state(handle)
             .layer(axum::extract::DefaultBodyLimit::max(
                 self.settings.max_body_size,
             ))
-            .layer(TimeoutLayer::new(self.settings.timeout))
+            .layer(TimeoutLayer::with_status_code(
+                StatusCode::REQUEST_TIMEOUT,
+                self.settings.timeout,
+            ))
             .layer(RequestBodyLimitLayer::new(self.settings.max_body_size))
             .layer(ConcurrencyLimitLayer::new(
                 self.settings.max_concurrent_requests,
             ))
-            .layer(TraceLayer::new_for_http())
+            .layer(
+                TraceLayer::new_for_http()
+                    .on_request(DefaultOnRequest::new().level(TracingLevel::TRACE))
+                    .on_response(DefaultOnResponse::new().level(TracingLevel::TRACE)),
+            )
             .layer(
                 builder
                     .allow_headers(vec![CONTENT_TYPE, USER_AGENT])

@@ -13,12 +13,13 @@ use lb_core::{crypto::ZkHash, proofs::leader_proof::LeaderPublic};
 use lb_cryptarchia_engine::{Epoch, Slot};
 use lb_groth16::Fr;
 use lb_ledger::EpochState;
+use lb_log_targets::blend;
 use lb_time_service::SlotTick;
 use overwatch::overwatch::OverwatchHandle;
 
 /// Secret `PoL` info associated to an epoch, as returned by the `PoL` info
 /// provider.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct PolEpochInfo {
     pub epoch: Epoch,
     pub poq_public_inputs: LeaderPublic,
@@ -46,13 +47,13 @@ pub trait PolInfoProvider<RuntimeServiceId> {
     ) -> Option<Self::Stream>;
 }
 
-const LOG_TARGET: &str = "blend::service::epoch";
+const LOG_TARGET: &str = blend::service::EPOCH;
 
 /// A trait that provides the needed functionalities for the epoch stream to
 /// fetch the epoch state for a given slot.
 #[async_trait]
 pub trait ChainApi<RuntimeServiceId> {
-    async fn get_epoch_state_for_slot(&self, slot: Slot) -> EpochState;
+    async fn get_epoch_state_for_slot(&self, slot: Slot) -> Option<EpochState>;
 }
 
 #[async_trait]
@@ -62,11 +63,18 @@ where
     Cryptarchia: CryptarchiaServiceData<Tx: Send + Sync>,
     RuntimeServiceId: Send + Sync,
 {
-    async fn get_epoch_state_for_slot(&self, slot: Slot) -> EpochState {
-        self.get_epoch_state(slot)
-            .await
-            .expect("Failed to get epoch state for slot.")
-            .expect("State for slot in current epoch should always be available")
+    async fn get_epoch_state_for_slot(&self, slot: Slot) -> Option<EpochState> {
+        match self.get_epoch_state(slot).await {
+            Ok(Ok(val)) => Some(val),
+            Ok(Err(e)) => {
+                tracing::error!(target: LOG_TARGET, "Get epoch state error: {e:?}.");
+                None
+            }
+            Err(e) => {
+                tracing::error!(target: LOG_TARGET, "Get epoch state API error: {e:?}.");
+                None
+            }
+        }
     }
 }
 
@@ -242,6 +250,10 @@ where
     ChainService: ChainApi<RuntimeServiceId> + Sync,
     RuntimeServiceId: Sync,
 {
+    #[expect(
+        clippy::cognitive_complexity,
+        reason = "TODO: address this in a dedicated refactor"
+    )]
     pub async fn tick(&mut self, new_tick: SlotTick) -> Option<EpochEvent> {
         // We try to validate the new tick, else we restore the last valid one that we
         // had.
@@ -271,11 +283,19 @@ where
         }
 
         tracing::debug!(target: LOG_TARGET, "Found epoch unseen before. Retrieving its state...");
-        let epoch_state = self
+        let Some(epoch_state) = self
             .chain_service
             .get_epoch_state_for_slot(new_tick.slot)
-            .await;
-        tracing::debug!(target: LOG_TARGET, "Retrieved epoch state for unseen epoch: {:?}.", epoch_state);
+            .await
+        else {
+            tracing::warn!(target: LOG_TARGET, "Failed to get epoch state for slot.  Skipping...");
+            return None;
+        };
+        tracing::debug!(
+            target: LOG_TARGET,
+            "Retrieved epoch state for unseen epoch {:?}",
+            epoch_state.epoch()
+        );
 
         // This is true if epochs are shorter than transition periods. It's not likely
         // to happen in production, but we must still account for this

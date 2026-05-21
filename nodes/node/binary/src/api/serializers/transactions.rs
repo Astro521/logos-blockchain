@@ -1,7 +1,4 @@
-use lb_core::mantle::{
-    MantleTx, Op, OpProof, SignedMantleTx, TxHash, gas::Gas, ledger::Tx as LedgerTx,
-};
-use lb_key_management_system_service::keys::ZkSignature;
+use lb_core::mantle::{MantleTx, OpProof, SignedMantleTx, TxHash, encoding::Ops};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -9,10 +6,8 @@ use serde::Serialize;
 pub struct ApiTransactionSerializer {
     #[serde(getter = "<MantleTx as lb_core::mantle::Transaction>::hash")]
     hash: TxHash,
-    ops: Vec<Op>,
-    ledger_tx: LedgerTx,
-    execution_gas_price: Gas,
-    storage_gas_price: Gas,
+    #[serde(getter = "MantleTx::ops")]
+    ops: Ops,
 }
 
 #[derive(Serialize)]
@@ -21,19 +16,24 @@ pub struct ApiSignedTransactionSerializer {
     #[serde(with = "ApiTransactionSerializer")]
     mantle_tx: MantleTx,
     ops_proofs: Vec<OpProof>,
-    ledger_tx_proof: ZkSignature,
 }
 
-#[derive(serde::Serialize)]
-struct SignedApiTransaction<'a>(
+#[derive(Serialize)]
+pub struct ApiSignedTransactionRef<'a>(
     #[serde(with = "ApiSignedTransactionSerializer")] &'a SignedMantleTx,
 );
+
+impl<'a> From<&'a SignedMantleTx> for ApiSignedTransactionRef<'a> {
+    fn from(value: &'a SignedMantleTx) -> Self {
+        Self(value)
+    }
+}
 
 pub mod signed_api_transaction_vec {
     use lb_core::mantle::SignedMantleTx;
     use serde::ser::SerializeSeq as _;
 
-    use crate::api::serializers::transactions::SignedApiTransaction;
+    use crate::api::serializers::transactions::ApiSignedTransactionRef;
 
     pub fn serialize<Serializer>(
         value: &Vec<SignedMantleTx>,
@@ -44,7 +44,7 @@ pub mod signed_api_transaction_vec {
     {
         let mut sequence = serializer.serialize_seq(Some(value.len()))?;
         for transaction in value {
-            let signed_api_transaction = SignedApiTransaction(transaction);
+            let signed_api_transaction = ApiSignedTransactionRef(transaction);
             sequence.serialize_element(&signed_api_transaction)?;
         }
         sequence.end()

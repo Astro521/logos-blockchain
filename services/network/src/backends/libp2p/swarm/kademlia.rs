@@ -4,10 +4,13 @@ use lb_libp2p::{
     Multiaddr, PeerId, Protocol,
     libp2p::kad::{self, PeerInfo, ProgressStep, QueryId},
 };
+use lb_log_targets::network_service;
 use rand::RngCore;
 use tokio::sync::oneshot;
 
 use crate::backends::libp2p::swarm::SwarmHandler;
+
+const LOG_TARGET: &str = network_service::backends::libp2p::KADEMLIA;
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -36,12 +39,25 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             if let Some(Protocol::P2p(peer_id_bytes)) = peer_addr.iter().last() {
                 if let Ok(peer_id) = PeerId::from_multihash(peer_id_bytes.into()) {
                     self.swarm.kademlia_add_address(peer_id, peer_addr);
-                    tracing::debug!("Added peer to Kademlia: {} at {}", peer_id, peer_addr);
+                    tracing::trace!(
+                        target: LOG_TARGET,
+                        "Added peer to Kademlia: {} at {}",
+                        peer_id,
+                        peer_addr
+                    );
                 } else {
-                    tracing::warn!("Failed to parse peer ID from multiaddr: {}", peer_addr);
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        "Failed to parse peer ID from multiaddr: {}",
+                        peer_addr
+                    );
                 }
             } else {
-                tracing::warn!("Multiaddr doesn't contain peer ID: {}", peer_addr);
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    "Multiaddr doesn't contain peer ID: {}",
+                    peer_addr
+                );
             }
         }
     }
@@ -50,7 +66,7 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
         match command {
             DiscoveryCommand::GetClosestPeers { peer_id, reply } => {
                 let query_id = self.swarm.get_closest_peers(peer_id);
-                tracing::debug!("Pending query ID: {query_id}");
+                tracing::trace!(target: LOG_TARGET, "Pending query ID: {query_id}");
                 self.pending_queries.insert(
                     query_id,
                     PendingQueryData {
@@ -71,7 +87,7 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             }
             DiscoveryCommand::DumpRoutingTable { reply } => {
                 let result = self.swarm.kademlia_routing_table_dump();
-                tracing::debug!("Routing table dump: {result:?}");
+                tracing::trace!(target: LOG_TARGET, "Routing table dump: {result:?}");
                 drop(reply.send(result));
             }
         }
@@ -93,8 +109,11 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
             } => {
                 log_routing_update(peer, &addresses.into_vec(), old_peer, is_new_peer);
             }
+            kad::Event::ModeChanged { new_mode } => {
+                tracing::info!(target: LOG_TARGET, "Kademlia mode changed to {new_mode:?}");
+            }
             event => {
-                tracing::debug!("Kademlia event: {:?}", event);
+                tracing::trace!(target: LOG_TARGET, "Kademlia event: {:?}", event);
             }
         }
     }
@@ -118,14 +137,14 @@ impl<R: Clone + Send + RngCore + 'static> SwarmHandler<R> {
                 }
             }
             kad::QueryResult::GetClosestPeers(Err(err)) => {
-                tracing::warn!("Failed to find closest peers: {:?}", err);
+                tracing::warn!(target: LOG_TARGET, "Failed to find closest peers: {:?}", err);
                 // For errors, we should probably just send what we have so far
                 if let Some(query_data) = self.pending_queries.remove(&id) {
                     drop(query_data.sender.send(query_data.accumulated_results));
                 }
             }
             _ => {
-                tracing::debug!("Handle kademlia query result: {:?}", result);
+                tracing::trace!(target: LOG_TARGET, "Handle kademlia query result: {:?}", result);
             }
         }
     }
@@ -137,7 +156,8 @@ fn log_routing_update(
     old_peer: Option<PeerId>,
     is_new_peer: bool,
 ) {
-    tracing::debug!(
+    tracing::trace!(
+        target: LOG_TARGET,
         "Routing table updated: peer: {peer}, address: {address:?}, \
          old_peer: {old_peer:?}, is_new_peer: {is_new_peer}"
     );

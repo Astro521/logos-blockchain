@@ -1,22 +1,257 @@
-use std::sync::LazyLock;
+use std::{collections::HashSet, slice, sync::LazyLock};
 
+use ark_ff::PrimeField as _;
 use bytes::Bytes;
-use lb_groth16::{
-    Fr, GROTH16_SAFE_BYTES_SIZE, fr_from_bytes, fr_from_bytes_unchecked, serde::serde_fr,
-};
+use lb_groth16::{Fr, fr_from_bytes, serde::serde_fr};
 use lb_key_management_system_keys::keys::ZkPublicKey;
-use lb_poseidon2::Digest;
+use lb_poseidon2::Digest as _;
+use lb_utxotree::UtxoTree;
 use num_bigint::BigUint;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::{
-    crypto::ZkHasher,
-    mantle::{
-        Transaction, TransactionHasher, encoding::encode_ledger_tx, gas::GasConstants, tx::TxHash,
-    },
+    crypto::{Hash, ZkHasher},
+    events::Events,
+    mantle::ops::OpId,
+    sdp::{Declaration, DeclarationId, locked_notes::LockedNotes},
 };
 
+pub trait Operation<ValidationContext> {
+    type ExecutionContext<'a>
+    where
+        Self: 'a;
+    type Error;
+    fn validate(&self, ctx: &ValidationContext) -> Result<(), Self::Error>;
+    fn execute(
+        &self,
+        ctx: Self::ExecutionContext<'_>,
+    ) -> Result<(Self::ExecutionContext<'_>, Events), Self::Error>;
+}
+
+pub type Utxos = UtxoTree<NoteId, Utxo, ZkHasher>;
+pub type Declarations = rpds::RedBlackTreeMapSync<DeclarationId, Declaration>;
+
 pub type Value = u64;
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum InputsError {
+    #[error("Note: {0:?} isn't in the ledger")]
+    InexistingNote(NoteId),
+    #[error("Locked note: {0:?}")]
+    LockedNote(NoteId),
+    #[error("Inputs contain try to double spend the same NoteId")]
+    DoubleSpend,
+    #[error("Sum of input values overflows")]
+    InputsOverflow,
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum OutputsError {
+    #[error("Zero value note")]
+    ZeroValueNote,
+    #[error("Sum of output values overflows")]
+    OutputsOverflow,
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum LedgerError {
+    #[error("Inputs error: {0}")]
+    Inputs(#[from] InputsError),
+    #[error("Outputs error: {0}")]
+    Outputs(#[from] OutputsError),
+}
+
+#[derive(Clone, Eq, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Outputs(Vec<Note>);
+
+impl Outputs {
+    #[must_use]
+    pub const fn new(notes: Vec<Note>) -> Self {
+        Self(notes)
+    }
+
+    pub fn utxos<O: OpId>(&self, op: &O) -> impl Iterator<Item = Utxo> {
+        self.0.iter().enumerate().map(move |(index, note)| Utxo {
+            op_id: op.op_id(),
+            output_index: index,
+            note: *note,
+        })
+    }
+
+    pub fn utxo_by_index<O: OpId>(&self, index: usize, op: &O) -> Option<Utxo> {
+        self.0.get(index).map(|note| Utxo {
+            op_id: op.op_id(),
+            output_index: index,
+            note: *note,
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), OutputsError> {
+        // Check that there is no duplicate
+        for note in &self.0 {
+            if note.value == 0 {
+                return Err(OutputsError::ZeroValueNote);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn execute<O: OpId>(&self, mut utxos: Utxos, op: &O) -> Utxos {
+        for utxo in self.utxos(op) {
+            utxos = utxos.insert(utxo.id(), utxo).0;
+        }
+        utxos
+    }
+
+    pub fn amount(&self) -> Result<Value, OutputsError> {
+        let mut amount: Value = 0;
+        for output in &self.0 {
+            amount = amount
+                .checked_add(output.value)
+                .ok_or(OutputsError::OutputsOverflow)?;
+        }
+        Ok(amount)
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> slice::Iter<'_, Note> {
+        <&Self as IntoIterator>::into_iter(self)
+    }
+}
+
+impl AsRef<Vec<Note>> for Outputs {
+    fn as_ref(&self) -> &Vec<Note> {
+        &self.0
+    }
+}
+
+impl AsMut<Vec<Note>> for Outputs {
+    fn as_mut(&mut self) -> &mut Vec<Note> {
+        &mut self.0
+    }
+}
+
+impl<'output> IntoIterator for &'output Outputs {
+    type Item = <slice::Iter<'output, Note> as IntoIterator>::Item;
+    type IntoIter = slice::Iter<'output, Note>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+#[derive(Clone, Eq, Debug, PartialEq, Hash, Serialize, Deserialize)]
+pub struct Inputs(Vec<NoteId>);
+
+impl Inputs {
+    #[must_use]
+    pub const fn new(note_ids: Vec<NoteId>) -> Self {
+        Self(note_ids)
+    }
+
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(vec![])
+    }
+
+    pub fn validate(&self, locked_notes: &LockedNotes, utxos: &Utxos) -> Result<(), InputsError> {
+        // Check that there is no duplicate
+        let unique: HashSet<_> = self.0.iter().collect();
+        if unique.len() != self.0.len() {
+            return Err(InputsError::DoubleSpend);
+        }
+        // Check each note is spendable
+        for input in &self.0 {
+            // Check the note isn't locked
+            if locked_notes.contains(input) {
+                return Err(InputsError::LockedNote(*input));
+            }
+            // Check the note exist in the ledger
+            if !utxos.contains(input) {
+                return Err(InputsError::InexistingNote(*input));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn execute(&self, mut utxos: Utxos) -> Result<Utxos, InputsError> {
+        // Remove notes from the ledger one by one
+        for input in &self.0 {
+            (utxos, _) = utxos
+                .remove(input)
+                .map_err(|_| InputsError::InexistingNote(*input))?;
+        }
+        Ok(utxos)
+    }
+
+    pub fn amount(&self, utxos: &Utxos) -> Result<Value, InputsError> {
+        let mut amount: Value = 0;
+        for input in &self.0 {
+            let utxo = utxos
+                .get(input)
+                .ok_or(InputsError::InexistingNote(*input))?;
+            amount = amount
+                .checked_add(utxo.note.value)
+                .ok_or(InputsError::InputsOverflow)?;
+        }
+        Ok(amount)
+    }
+
+    pub fn get_pk(&self, utxos: &Utxos) -> Result<Vec<ZkPublicKey>, InputsError> {
+        let mut pks: Vec<ZkPublicKey> = vec![];
+        for input in &self.0 {
+            let utxo = utxos
+                .get(input)
+                .ok_or(InputsError::InexistingNote(*input))?;
+            pks.push(utxo.note.pk);
+        }
+        Ok(pks)
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> slice::Iter<'_, NoteId> {
+        <&Self as IntoIterator>::into_iter(self)
+    }
+}
+
+impl AsRef<Vec<NoteId>> for Inputs {
+    fn as_ref(&self) -> &Vec<NoteId> {
+        &self.0
+    }
+}
+
+impl AsMut<Vec<NoteId>> for Inputs {
+    fn as_mut(&mut self) -> &mut Vec<NoteId> {
+        &mut self.0
+    }
+}
+impl<'input> IntoIterator for &'input Inputs {
+    type Item = <slice::Iter<'input, NoteId> as IntoIterator>::Item;
+    type IntoIter = slice::Iter<'input, NoteId>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -64,15 +299,9 @@ impl Note {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Tx {
-    pub inputs: Vec<NoteId>,
-    pub outputs: Vec<Note>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Utxo {
-    pub tx_hash: TxHash,
+    pub op_id: Hash,
     pub output_index: usize,
     pub note: Note,
 }
@@ -83,9 +312,9 @@ static NOTE_ID_V1: LazyLock<Fr> = LazyLock::new(|| {
 
 impl Utxo {
     #[must_use]
-    pub const fn new(tx_hash: TxHash, output_index: usize, note: Note) -> Self {
+    pub const fn new(op_id: Hash, output_index: usize, note: Note) -> Self {
         Self {
-            tx_hash,
+            op_id,
             output_index,
             note,
         }
@@ -94,9 +323,9 @@ impl Utxo {
     #[must_use]
     pub fn id(&self) -> NoteId {
         // constants and structure as defined in the Mantle spec:
-        // https://www.notion.so/Mantle-Specification-21c261aa09df810c8820fab1d78b53d9
+        // https://www.notion.so/nomos-tech/v1-4-Mantle-Specification-335261aa09df8065a38acff4b25aee82
 
-        let tx_hash: Fr = *self.tx_hash.as_ref();
+        let op_id: Fr = Fr::from_le_bytes_mod_order(self.op_id.as_ref());
         let output_index =
             fr_from_bytes(self.output_index.to_le_bytes().as_slice()).expect("usize fits in Fr");
         let note_value: Fr =
@@ -105,69 +334,11 @@ impl Utxo {
 
         NoteId(ZkHasher::digest(&[
             *NOTE_ID_V1,
-            tx_hash,
+            op_id,
             output_index,
             note_value,
             note_pk,
         ]))
-    }
-}
-
-static LEDGER_TXHASH_V1_FR: LazyLock<Fr> =
-    LazyLock::new(|| fr_from_bytes(b"LEDGER_TXHASH_V1").expect("Constant should be valid Fr"));
-
-impl Tx {
-    #[must_use]
-    pub const fn new(inputs: Vec<NoteId>, outputs: Vec<Note>) -> Self {
-        Self { inputs, outputs }
-    }
-
-    #[must_use]
-    pub fn as_signing_frs(&self) -> Vec<Fr> {
-        // constants and structure as defined in the Mantle spec:
-        // https://www.notion.so/Mantle-Specification-21c261aa09df810c8820fab1d78b53d9
-        let encoded_bytes = encode_ledger_tx(self);
-        let frs = encoded_bytes
-            .as_slice()
-            .chunks(GROTH16_SAFE_BYTES_SIZE)
-            .map(fr_from_bytes_unchecked);
-        std::iter::once(*LEDGER_TXHASH_V1_FR).chain(frs).collect()
-    }
-
-    #[must_use]
-    pub fn utxo_by_index(&self, index: usize) -> Option<Utxo> {
-        self.outputs.get(index).map(|note| Utxo {
-            tx_hash: self.hash(),
-            output_index: index,
-            note: *note,
-        })
-    }
-
-    #[must_use]
-    pub const fn execution_gas<Constants: GasConstants>(&self) -> u64 {
-        Constants::LEDGER_TX
-    }
-
-    pub fn utxos(&self) -> impl Iterator<Item = Utxo> + '_ {
-        let tx_hash = self.hash();
-        self.outputs
-            .iter()
-            .enumerate()
-            .map(move |(index, note)| Utxo {
-                tx_hash,
-                output_index: index,
-                note: *note,
-            })
-    }
-}
-
-impl Transaction for Tx {
-    const HASHER: TransactionHasher<Self> =
-        |tx| <ZkHasher as Digest>::digest(&tx.as_signing_frs()).into();
-    type Hash = TxHash;
-
-    fn as_signing_frs(&self) -> Vec<Fr> {
-        Self::as_signing_frs(self)
     }
 }
 
@@ -183,7 +354,7 @@ mod test {
     #[test]
     fn test_note_id() {
         let utxo = Utxo::new(
-            TxHash::from(Fr::from(BigUint::from(123u32))),
+            [0u8; 32],
             0,
             Note::new(100, ZkPublicKey::from(Fr::from(BigUint::from(456u32)))),
         );
@@ -191,51 +362,10 @@ mod test {
             utxo.id(),
             NoteId::from(
                 Fr::from_str(
-                    "7000453536948078697982837270969513402421497654766692285707895413806329167703"
+                    "7557997998773395727489806263315711564569794358720487479582958381680367418066"
                 )
                 .unwrap()
             )
         );
-    }
-
-    #[test]
-    fn test_utxo_by_index() {
-        let pk0 = ZkPublicKey::from(Fr::from(BigUint::from(0u8)));
-        let pk1 = ZkPublicKey::from(Fr::from(BigUint::from(1u8)));
-        let pk2 = ZkPublicKey::from(Fr::from(BigUint::from(2u8)));
-        let tx = Tx {
-            inputs: vec![NoteId(BigUint::from(0u8).into())],
-            outputs: vec![
-                Note::new(100, pk0),
-                Note::new(200, pk1),
-                Note::new(300, pk2),
-            ],
-        };
-        assert_eq!(
-            tx.utxo_by_index(0),
-            Some(Utxo {
-                tx_hash: tx.hash(),
-                output_index: 0,
-                note: Note::new(100, pk0),
-            })
-        );
-        assert_eq!(
-            tx.utxo_by_index(1),
-            Some(Utxo {
-                tx_hash: tx.hash(),
-                output_index: 1,
-                note: Note::new(200, pk1),
-            })
-        );
-        assert_eq!(
-            tx.utxo_by_index(2),
-            Some(Utxo {
-                tx_hash: tx.hash(),
-                output_index: 2,
-                note: Note::new(300, pk2),
-            })
-        );
-
-        assert!(tx.utxo_by_index(3).is_none());
     }
 }

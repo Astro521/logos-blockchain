@@ -1,11 +1,12 @@
 use lb_groth16::{Fr, serde::serde_fr};
-use lb_utxotree::MerklePath;
+use lb_mmr::MerklePath;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::error;
 
 use crate::{
     mantle::ops::leader_claim::{VoucherNullifier, VoucherSecret},
-    proofs::merkle::merkle_path_to_witness,
+    proofs::merkle::mmr_path_to_witness,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -43,6 +44,11 @@ impl Groth16LeaderClaimProof {
     pub const fn proof(&self) -> &lb_poc::PoCProof {
         &self.proof
     }
+
+    #[must_use]
+    pub const fn new(proof: lb_poc::PoCProof, voucher_nf: VoucherNullifier) -> Self {
+        Self { proof, voucher_nf }
+    }
 }
 
 pub trait LeaderClaimProof {
@@ -62,7 +68,10 @@ impl LeaderClaimProof for Groth16LeaderClaimProof {
                 public_inputs.mantle_tx_hash,
             ),
         )
-        .is_ok()
+        .unwrap_or_else(|e| {
+            error!("Error verifying LeaderClaimProof: {e:?}");
+            false
+        })
     }
 
     fn voucher_nf(&self) -> &VoucherNullifier {
@@ -97,7 +106,7 @@ impl LeaderClaimPrivate {
     #[must_use]
     pub fn new(
         public: LeaderClaimPublic,
-        voucher_path: &MerklePath<Fr>,
+        voucher_path: &MerklePath,
         secret_voucher: VoucherSecret,
     ) -> Self {
         let chain = lb_poc::PoCChainInputsData {
@@ -105,11 +114,12 @@ impl LeaderClaimPrivate {
             mantle_tx_hash: public.mantle_tx_hash,
         };
         let (voucher_merkle_path, voucher_merkle_path_selectors) =
-            merkle_path_to_witness(voucher_path);
+            mmr_path_to_witness(voucher_path);
         let wallet = lb_poc::PoCWalletInputsData {
             secret_voucher: secret_voucher.into(),
-            voucher_merkle_path,
-            voucher_merkle_path_selectors,
+            voucher_merkle_path_and_selectors: core::array::from_fn(|i| {
+                (voucher_merkle_path[i], voucher_merkle_path_selectors[i])
+            }),
         };
         let input = lb_poc::PoCWitnessInputsData::from_chain_and_wallet_data(chain, wallet);
         Self { input }

@@ -1,6 +1,7 @@
 use core::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 
+pub use lb_tracing::logging::local::AppenderType;
 use lb_tracing_service::LoggerLayerSettings;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -24,6 +25,7 @@ impl Default for Layers {
             file: Some(FileConfig {
                 directory: PathBuf::from("."),
                 prefix: Some(date_prefix.into()),
+                appender_type: AppenderType::Simple,
             }),
             stdout: true,
             stderr: false,
@@ -40,6 +42,7 @@ impl From<Layers> for LoggerLayerSettings {
             file: value.file.map(|f| lb_tracing::logging::local::FileConfig {
                 directory: f.directory,
                 prefix: f.prefix,
+                appender_type: f.appender_type,
             }),
             loki: value.loki.map(|l| lb_tracing::logging::loki::LokiConfig {
                 endpoint: l.endpoint,
@@ -51,6 +54,7 @@ impl From<Layers> for LoggerLayerSettings {
             otlp: value.otlp.map(|o| lb_tracing::logging::otlp::OtlpConfig {
                 endpoint: o.endpoint,
                 service_name: o.service_name,
+                authorization_header: o.authorization_header,
             }),
             stdout: value.stdout,
             stderr: value.stderr,
@@ -77,6 +81,7 @@ impl Default for GelfConfig {
 pub struct FileConfig {
     pub directory: PathBuf,
     pub prefix: Option<PathBuf>,
+    pub appender_type: AppenderType,
 }
 
 impl Default for FileConfig {
@@ -84,6 +89,7 @@ impl Default for FileConfig {
         Self {
             directory: "./logs".into(),
             prefix: None,
+            appender_type: AppenderType::Simple,
         }
     }
 }
@@ -98,4 +104,6 @@ pub struct LokiConfig {
 pub struct OtlpConfig {
     pub endpoint: Url,
     pub service_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_header: Option<String>,
 }

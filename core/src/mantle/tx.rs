@@ -1,67 +1,61 @@
-use std::sync::LazyLock;
-
-use bytes::Bytes;
-use lb_groth16::{
-    Fr, GROTH16_SAFE_BYTES_SIZE, fr_from_bytes, fr_from_bytes_unchecked, fr_to_bytes,
-    serde::serde_fr,
+use std::{
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
 };
-use lb_key_management_system_keys::keys::ZkSignature;
-use lb_poseidon2::{Digest, ZkHash};
-use num_bigint::BigUint;
+
+use ark_ff::PrimeField as _;
+use bytes::Bytes;
+use lb_groth16::Fr;
+use lb_key_management_system_keys::keys::Ed25519PublicKey;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    crypto::ZkHasher,
+    crypto::{Digest as _, Hash, Hasher},
     mantle::{
-        AuthenticatedMantleTx, Transaction, TransactionHasher,
-        encoding::{decode_mantle_tx, encode_mantle_tx, encode_signed_mantle_tx},
-        gas::{Gas, GasConstants, GasCost},
-        ledger::Tx as LedgerTx,
-        ops::{Op, OpProof},
+        AuthenticatedMantleTx, StorageSize, Transaction, TransactionHasher, Value,
+        channel::Channels,
+        encoding::{Ops, decode_mantle_tx, encode_mantle_tx, encode_signed_mantle_tx},
+        gas::{Gas, GasCalculator, GasConstants, GasCost, GasOverflow, GasPrice},
+        genesis_tx::{GENESIS_EXECUTION_GAS_PRICE, GENESIS_STORAGE_GAS_PRICE},
+        ops::{
+            Op, OpProof,
+            channel::{ChannelId, ChannelKeyIndex, withdraw::ChannelWithdrawOp},
+            transfer::TransferOp,
+        },
     },
-    proofs::leader_claim_proof::{LeaderClaimProof as _, LeaderClaimPublic},
+    proofs::{
+        channel_multi_sig_proof::ChannelMultiSigProof,
+        leader_claim_proof::{LeaderClaimProof as _, LeaderClaimPublic},
+    },
+    utils::serde_bytes_newtype,
 };
 
 /// The hash of a transaction
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct TxHash(#[serde(with = "serde_fr")] pub ZkHash);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash, PartialOrd, Ord)]
+pub struct TxHash(pub Hash);
+serde_bytes_newtype!(TxHash, 32);
 
-impl From<ZkHash> for TxHash {
-    fn from(fr: ZkHash) -> Self {
-        Self(fr)
+impl From<Hash> for TxHash {
+    fn from(hash: Hash) -> Self {
+        Self(hash)
     }
 }
 
-impl From<BigUint> for TxHash {
-    fn from(value: BigUint) -> Self {
-        Self(value.into())
-    }
-}
-
-impl From<TxHash> for ZkHash {
+impl From<TxHash> for Hash {
     fn from(hash: TxHash) -> Self {
         hash.0
     }
 }
 
-impl AsRef<ZkHash> for TxHash {
-    fn as_ref(&self) -> &ZkHash {
+impl AsRef<Hash> for TxHash {
+    fn as_ref(&self) -> &Hash {
         &self.0
     }
 }
 
 impl From<TxHash> for Bytes {
     fn from(tx_hash: TxHash) -> Self {
-        Self::copy_from_slice(&fr_to_bytes(tx_hash.as_ref()))
-    }
-}
-
-impl From<TxHash> for [u8; 32] {
-    fn from(tx_hash: TxHash) -> Self {
-        fr_to_bytes(tx_hash.as_ref())
+        Self::copy_from_slice(&tx_hash.0)
     }
 }
 
@@ -69,64 +63,122 @@ impl TxHash {
     /// For testing purposes
     #[cfg(test)]
     pub fn random(mut rng: impl rand::RngCore) -> Self {
-        Self(BigUint::from(rng.next_u64()).into())
+        let mut bytes = [0u8; 32];
+        rng.fill_bytes(&mut bytes);
+        Self(bytes)
     }
 
     #[must_use]
     pub fn as_signing_bytes(&self) -> Bytes {
-        self.0.0.0.iter().flat_map(|b| b.to_le_bytes()).collect()
+        Bytes::from(self.0.to_vec())
+    }
+
+    #[must_use]
+    pub fn to_fr(&self) -> Fr {
+        Fr::from_le_bytes_mod_order(&self.0)
     }
 }
 
 #[derive(Serialize, Deserialize)]
 struct MantleTxDeSerImpl {
-    pub ops: Vec<Op>,
-    pub ledger_tx: LedgerTx,
-    pub execution_gas_price: Gas,
-    pub storage_gas_price: Gas,
+    pub ops: Ops,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MantleTx {
-    pub ops: Vec<Op>,
-    pub ledger_tx: LedgerTx,
-    pub execution_gas_price: Gas,
-    pub storage_gas_price: Gas,
+#[derive(Debug, Clone, Default)]
+pub struct MantleTxContext {
+    pub gas_context: MantleTxGasContext,
+    pub leader_reward_amount: Value,
 }
 
-impl From<MantleTxDeSerImpl> for MantleTx {
-    fn from(
-        MantleTxDeSerImpl {
-            ops,
-            ledger_tx,
-            execution_gas_price,
-            storage_gas_price,
-        }: MantleTxDeSerImpl,
-    ) -> Self {
+#[derive(Debug, Clone, Default)]
+pub struct MantleTxGasContext {
+    withdraw_thresholds: HashMap<ChannelId, ChannelKeyIndex>,
+    configuration_thresholds: HashMap<ChannelId, ChannelKeyIndex>,
+    gas_prices: GasPrices,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GasPrices {
+    pub execution_base_gas_price: GasPrice,
+    pub storage_gas_price: GasPrice,
+}
+
+impl GasPrices {
+    #[must_use]
+    pub fn new(execution: u64, storage: u64) -> Self {
         Self {
-            ops,
-            ledger_tx,
-            execution_gas_price,
-            storage_gas_price,
+            execution_base_gas_price: execution.into(),
+            storage_gas_price: storage.into(),
         }
     }
 }
 
-impl From<MantleTx> for MantleTxDeSerImpl {
-    fn from(
-        MantleTx {
-            ops,
-            ledger_tx,
-            execution_gas_price,
-            storage_gas_price,
-        }: MantleTx,
+impl Default for GasPrices {
+    fn default() -> Self {
+        Self {
+            execution_base_gas_price: GENESIS_EXECUTION_GAS_PRICE,
+            storage_gas_price: GENESIS_STORAGE_GAS_PRICE,
+        }
+    }
+}
+
+impl MantleTxGasContext {
+    #[must_use]
+    pub const fn new(
+        withdraw_thresholds: HashMap<ChannelId, ChannelKeyIndex>,
+        configuration_thresholds: HashMap<ChannelId, ChannelKeyIndex>,
+        gas_prices: GasPrices,
     ) -> Self {
         Self {
-            ops,
-            ledger_tx,
-            execution_gas_price,
-            storage_gas_price,
+            withdraw_thresholds,
+            configuration_thresholds,
+            gas_prices,
         }
+    }
+
+    #[must_use]
+    pub fn withdraw_threshold(&self, channel_id: &ChannelId) -> Option<ChannelKeyIndex> {
+        self.withdraw_thresholds.get(channel_id).copied()
+    }
+
+    #[must_use]
+    pub fn configuration_threshold(&self, channel_id: &ChannelId) -> Option<ChannelKeyIndex> {
+        self.configuration_thresholds.get(channel_id).copied()
+    }
+
+    #[must_use]
+    pub fn from_channels(value: &Channels, base_prices: GasPrices) -> Self {
+        let withdraw_thresholds = value
+            .channels
+            .iter()
+            .map(|(channel_id, channel)| (*channel_id, channel.withdraw_threshold))
+            .collect();
+        let configuration_thresholds = value
+            .channels
+            .iter()
+            .map(|(channel_id, channel)| (*channel_id, channel.configuration_threshold))
+            .collect();
+        Self::new(withdraw_thresholds, configuration_thresholds, base_prices)
+    }
+
+    #[must_use]
+    pub fn get_gas_prices(&self) -> GasPrices {
+        self.gas_prices.clone()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MantleTx(pub Ops);
+
+impl From<MantleTxDeSerImpl> for MantleTx {
+    fn from(MantleTxDeSerImpl { ops }: MantleTxDeSerImpl) -> Self {
+        Self(ops)
+    }
+}
+
+impl From<MantleTx> for MantleTxDeSerImpl {
+    fn from(MantleTx(ops): MantleTx) -> Self {
+        Self { ops }
     }
 }
 
@@ -161,45 +213,81 @@ impl<'de> Deserialize<'de> for MantleTx {
     }
 }
 
-impl GasCost for MantleTx {
-    fn gas_cost<Constants: GasConstants>(&self) -> Gas {
-        let execution_gas = self
-            .ops
+impl GasCalculator for MantleTx {
+    type Context = MantleTxGasContext;
+
+    fn total_gas_cost<Constants: GasConstants>(
+        &self,
+        context: &Self::Context,
+    ) -> Result<GasCost, GasOverflow> {
+        let execution_gas = self.execution_gas_consumption::<Constants>(context);
+        let execution_gas_cost =
+            GasCost::calculate(execution_gas?, context.gas_prices.execution_base_gas_price)?;
+        let storage_gas_cost = self.storage_gas_cost(context)?;
+
+        execution_gas_cost.checked_add(storage_gas_cost)
+    }
+
+    fn storage_gas_cost(&self, context: &Self::Context) -> Result<GasCost, GasOverflow> {
+        GasCost::calculate(
+            self.storage_gas_consumption(context)?,
+            context.gas_prices.storage_gas_price,
+        )
+    }
+
+    fn execution_gas_consumption<Constants: GasConstants>(
+        &self,
+        _context: &Self::Context,
+    ) -> Result<Gas, GasOverflow> {
+        self.ops()
             .iter()
             .map(Op::execution_gas::<Constants>)
-            .sum::<Gas>()
-            + self.ledger_tx.execution_gas::<Constants>();
-        let storage_gas = self.signed_serialized_size();
+            .try_fold(Gas::from(0), Gas::checked_add)
+    }
 
-        execution_gas * self.execution_gas_price + storage_gas * self.storage_gas_price
+    fn storage_gas_consumption(&self, context: &Self::Context) -> Result<Gas, GasOverflow> {
+        Ok(self.signed_serialized_size(context).into())
     }
 }
 
 impl MantleTx {
     #[must_use]
-    pub fn signed_serialized_size(&self) -> u64 {
-        super::encoding::predict_signed_mantle_tx_size(self) as u64
+    pub fn signed_serialized_size(&self, context: &<Self as GasCalculator>::Context) -> u64 {
+        super::encoding::predict_signed_mantle_tx_size(self, context) as u64
+    }
+
+    #[must_use]
+    pub fn transfers(&self) -> Vec<TransferOp> {
+        let mut transfers: Vec<TransferOp> = vec![];
+        for op in self.ops() {
+            if let Op::Transfer(transfer_op) = op {
+                transfers.push(transfer_op.clone());
+            }
+        }
+        transfers
+    }
+
+    #[must_use]
+    pub const fn ops(&self) -> &Ops {
+        &self.0
     }
 }
 
-static MANTLE_TXHASH_V1_FR: LazyLock<Fr> =
-    LazyLock::new(|| fr_from_bytes(b"MANTLE_TXHASH_V1").expect("Constant should be valid Fr"));
+static MANTLE_TXHASH_V1_BYTES: LazyLock<Vec<u8>> = LazyLock::new(|| b"MANTLE_TXHASH_V1".to_vec());
 
 impl Transaction for MantleTx {
-    const HASHER: TransactionHasher<Self> =
-        |tx| <ZkHasher as Digest>::digest(&tx.as_signing_frs()).into();
+    const HASHER: TransactionHasher<Self> = |tx| {
+        let bytes: [u8; 32] = Hasher::digest(tx.as_signing()).into();
+        TxHash::from(bytes)
+    };
     type Hash = TxHash;
 
-    fn as_signing_frs(&self) -> Vec<Fr> {
+    fn as_signing(&self) -> Vec<u8> {
         // constant and structure as defined in the Mantle specification:
-        // https://www.notion.so/Mantle-Specification-21c261aa09df810c8820fab1d78b53d9
-        let encoded_bytes = encode_mantle_tx(self);
-        let frs = encoded_bytes
-            .as_slice()
-            .chunks(GROTH16_SAFE_BYTES_SIZE)
-            // safety: Any 31 bytes fits into a groth16 Fr, there is no need to check for ranges
-            .map(fr_from_bytes_unchecked);
-        std::iter::once(*MANTLE_TXHASH_V1_FR).chain(frs).collect()
+        // https://www.notion.so/nomos-tech/v1-3-Mantle-Specification-31e261aa09df818f9327ee87e5a6d433#31e261aa09df80aea7cff4eb98d61b6e
+        let mut buffer = MANTLE_TXHASH_V1_BYTES.to_vec();
+        buffer.extend(encode_mantle_tx(self));
+        buffer
     }
 }
 
@@ -209,12 +297,15 @@ impl From<SignedMantleTx> for MantleTx {
     }
 }
 
+// Deserializing here is dangerous, as it bypasses the verification without
+// confirmation.
+// TODO: Split entity into a system that allows for verification in different
+// stages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SignedMantleTx {
     pub mantle_tx: MantleTx,
     // TODO: make this more efficient
     pub ops_proofs: Vec<OpProof>,
-    pub ledger_tx_proof: ZkSignature,
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -233,11 +324,50 @@ pub enum VerificationError {
         op_type: &'static str,
         op_index: usize,
     },
-    #[error("Number of proofs ({proofs_count}) does not match number of operations ({ops_count})")]
+    #[error(
+        "The number of proofs ({proofs_count}) does not match the number of operations ({ops_count})"
+    )]
     ProofCountMismatch {
         ops_count: usize,
         proofs_count: usize,
     },
+    #[error("Channel {channel_id} could not be found")]
+    ChannelNotFound { channel_id: ChannelId },
+    #[error("Key {key_index} could not be found in channel {channel_id}")]
+    KeyNotFound {
+        channel_id: ChannelId,
+        key_index: ChannelKeyIndex,
+    },
+    #[error(
+        "Not enough signatures in ChannelMultiSigProof at index {op_index}: got {actual}, required {required}"
+    )]
+    ChannelMultiSigProofNotEnoughSignatures {
+        op_index: usize,
+        actual: usize,
+        required: ChannelKeyIndex,
+    },
+    #[error("Duplicate signature indices in ChannelMultiSigProof at index {op_index}")]
+    ChannelMultiSigProofDuplicateIndices { op_index: usize },
+    #[error(
+        "Invalid signature in ChannelMultiSigProof at index {op_index} for signature index {signature_index}"
+    )]
+    ChannelMultiSigProofInvalidSignature {
+        op_index: usize,
+        signature_index: usize,
+    },
+}
+
+pub trait OperationVerificationHelper {
+    fn get_channel_withdraw_threshold(
+        &self,
+        channel_id: &ChannelId,
+    ) -> Result<ChannelKeyIndex, VerificationError>;
+
+    fn get_key_from_channel_at_index(
+        &self,
+        channel_id: &ChannelId,
+        key_index: &ChannelKeyIndex,
+    ) -> Result<Ed25519PublicKey, VerificationError>;
 }
 
 impl SignedMantleTx {
@@ -247,15 +377,10 @@ impl SignedMantleTx {
     /// This enforces at construction time that:
     /// - `ChannelInscribe` operations have a valid Ed25519 signature from the
     ///   declared signer
-    pub fn new(
-        mantle_tx: MantleTx,
-        ops_proofs: Vec<OpProof>,
-        ledger_tx_proof: ZkSignature,
-    ) -> Result<Self, VerificationError> {
+    pub fn new(mantle_tx: MantleTx, ops_proofs: Vec<OpProof>) -> Result<Self, VerificationError> {
         let tx = Self {
             mantle_tx,
             ops_proofs,
-            ledger_tx_proof,
         };
         tx.verify_ops_proofs()?;
         Ok(tx)
@@ -265,24 +390,19 @@ impl SignedMantleTx {
     /// This should only be used for `GenesisTx` or in tests.
     #[doc(hidden)]
     #[must_use]
-    pub const fn new_unverified(
-        mantle_tx: MantleTx,
-        ops_proofs: Vec<OpProof>,
-        ledger_tx_proof: ZkSignature,
-    ) -> Self {
+    pub const fn new_unverified(mantle_tx: MantleTx, ops_proofs: Vec<OpProof>) -> Self {
         Self {
             mantle_tx,
             ops_proofs,
-            ledger_tx_proof,
         }
     }
 
     // TODO: might drop proofs after verification
     fn verify_ops_proofs(&self) -> Result<(), VerificationError> {
         // Check that we have the same number of proofs as ops
-        if self.mantle_tx.ops.len() != self.ops_proofs.len() {
+        if self.mantle_tx.ops().len() != self.ops_proofs.len() {
             return Err(VerificationError::ProofCountMismatch {
-                ops_count: self.mantle_tx.ops.len(),
+                ops_count: self.mantle_tx.ops().len(),
                 proofs_count: self.ops_proofs.len(),
             });
         }
@@ -292,7 +412,7 @@ impl SignedMantleTx {
 
         for (idx, (op, proof)) in self
             .mantle_tx
-            .ops
+            .ops()
             .iter()
             .zip(self.ops_proofs.iter())
             .enumerate()
@@ -314,14 +434,60 @@ impl SignedMantleTx {
                 (Op::LeaderClaim(leader_claim_op), OpProof::PoC(poc)) => {
                     let ok = poc.verify(&LeaderClaimPublic {
                         voucher_root: leader_claim_op.rewards_root.into(),
-                        mantle_tx_hash: tx_hash.into(),
+                        mantle_tx_hash: tx_hash.to_fr(),
                     });
                     if !ok {
                         return Err(VerificationError::InvalidProofOfClaim { op_index: idx });
                     }
                 }
                 // Other operations are checked by the ledger or don't require verification here
-                _ => {}
+                _ => {
+                    // TODO: If the op and proof don't match, we are silently
+                    // delaying the error
+                    //  until tx execution.
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn verify_ops_proofs_with_helper(
+        &self,
+        operation_verification_helper: &impl OperationVerificationHelper,
+    ) -> Result<(), VerificationError> {
+        let tx_hash = self.hash();
+        let tx_hash_bytes = tx_hash.as_signing_bytes();
+
+        for (idx, (op, proof)) in self
+            .mantle_tx
+            .ops()
+            .iter()
+            .zip(self.ops_proofs.iter())
+            .enumerate()
+        {
+            #[expect(
+                clippy::single_match_else,
+                reason = "Clearer and follows the pattern of verify_ops_proofs."
+            )]
+            match (op, proof) {
+                (
+                    Op::ChannelWithdraw(channel_withdraw_op),
+                    OpProof::ChannelMultiSigProof(proof),
+                ) => {
+                    verify_channel_withdraw(
+                        channel_withdraw_op,
+                        proof,
+                        &tx_hash_bytes,
+                        operation_verification_helper,
+                        idx,
+                    )?;
+                }
+                // Other operations don't require verification here
+                _ => {
+                    // TODO: If the op and proof don't match, we are silently
+                    //  delaying the error until tx execution.
+                }
             }
         }
 
@@ -333,43 +499,147 @@ impl SignedMantleTx {
     }
 }
 
+fn verify_channel_withdraw(
+    operation: &ChannelWithdrawOp,
+    proof: &ChannelMultiSigProof,
+    tx_hash_bytes: &Bytes,
+    helper: &impl OperationVerificationHelper,
+    op_index: usize,
+) -> Result<(), VerificationError> {
+    let channel_id = &operation.channel_id;
+    let withdraw_threshold = helper.get_channel_withdraw_threshold(channel_id)?;
+
+    let signatures = proof.signatures();
+    let signatures_len = signatures.len();
+    if signatures_len < withdraw_threshold as usize {
+        return Err(VerificationError::ChannelMultiSigProofNotEnoughSignatures {
+            op_index,
+            actual: signatures_len,
+            required: withdraw_threshold,
+        });
+    }
+
+    let indices_set = signatures
+        .iter()
+        .map(|signature| signature.channel_key_index)
+        .collect::<HashSet<_>>();
+    let indices_set_len = indices_set.len();
+    if indices_set_len != signatures_len {
+        return Err(VerificationError::ChannelMultiSigProofDuplicateIndices { op_index });
+    }
+
+    for (i, signature) in signatures.iter().enumerate() {
+        let public_key =
+            helper.get_key_from_channel_at_index(channel_id, &signature.channel_key_index)?;
+        if let Err(_error) = public_key.verify(tx_hash_bytes.as_ref(), &signature.signature) {
+            return Err(VerificationError::ChannelMultiSigProofInvalidSignature {
+                op_index,
+                signature_index: i,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 impl Transaction for SignedMantleTx {
-    const HASHER: TransactionHasher<Self> =
-        |tx| <ZkHasher as Digest>::digest(&tx.as_signing_frs()).into();
+    const HASHER: TransactionHasher<Self> = |tx| {
+        let bytes: [u8; 32] = Hasher::digest(tx.as_signing()).into();
+        TxHash::from(bytes)
+    };
     type Hash = TxHash;
 
-    fn as_signing_frs(&self) -> Vec<Fr> {
-        self.mantle_tx.as_signing_frs()
+    fn as_signing(&self) -> Vec<u8> {
+        self.mantle_tx.as_signing()
     }
 }
 
 impl AuthenticatedMantleTx for SignedMantleTx {
+    type Context = GasPrices;
+
     fn mantle_tx(&self) -> &MantleTx {
         &self.mantle_tx
     }
 
-    fn ledger_tx_proof(&self) -> &ZkSignature {
-        &self.ledger_tx_proof
+    fn ops_with_proof(&self) -> impl Iterator<Item = (&Op, &OpProof)> {
+        self.mantle_tx.ops().iter().zip(self.ops_proofs.iter())
     }
 
-    fn ops_with_proof(&self) -> impl Iterator<Item = (&Op, &OpProof)> {
-        self.mantle_tx.ops.iter().zip(self.ops_proofs.iter())
+    fn total_gas_cost<Constants: GasConstants>(
+        &self,
+        context: <Self as AuthenticatedMantleTx>::Context,
+    ) -> Result<GasCost, GasOverflow> {
+        GasCalculator::total_gas_cost::<Constants>(&self, &context)
+    }
+
+    fn storage_gas_cost(
+        &self,
+        context: <Self as AuthenticatedMantleTx>::Context,
+    ) -> Result<GasCost, GasOverflow> {
+        GasCalculator::storage_gas_cost(&self, &context)
+    }
+
+    fn execution_gas_consumption<Constants: GasConstants>(
+        &self,
+        context: <Self as AuthenticatedMantleTx>::Context,
+    ) -> Result<Gas, GasOverflow> {
+        GasCalculator::execution_gas_consumption::<Constants>(&self, &context)
+    }
+
+    fn storage_gas_consumption(
+        &self,
+        context: <Self as AuthenticatedMantleTx>::Context,
+    ) -> Result<Gas, GasOverflow> {
+        GasCalculator::storage_gas_consumption(&self, &context)
+    }
+
+    fn verify_ops_proofs_with_helper(
+        &self,
+        operation_verification_helper: &impl OperationVerificationHelper,
+    ) -> Result<(), VerificationError> {
+        Self::verify_ops_proofs_with_helper(self, operation_verification_helper)
     }
 }
 
-impl GasCost for SignedMantleTx {
-    fn gas_cost<Constants: GasConstants>(&self) -> Gas {
-        let execution_gas = self
-            .mantle_tx
-            .ops
+impl GasCalculator for SignedMantleTx {
+    type Context = GasPrices;
+
+    fn total_gas_cost<Constants: GasConstants>(
+        &self,
+        context: &Self::Context,
+    ) -> Result<GasCost, GasOverflow> {
+        let execution_gas = GasCalculator::execution_gas_consumption::<Constants>(&self, context)?;
+        let execution_gas_cost =
+            GasCost::calculate(execution_gas, context.execution_base_gas_price)?;
+        let storage_gas_cost = GasCalculator::storage_gas_cost(self, context)?;
+
+        execution_gas_cost.checked_add(storage_gas_cost)
+    }
+
+    fn storage_gas_cost(&self, context: &Self::Context) -> Result<GasCost, GasOverflow> {
+        let storage_gas = GasCalculator::storage_gas_consumption(&self, context)?;
+        GasCost::calculate(storage_gas, context.storage_gas_price)
+    }
+
+    fn execution_gas_consumption<Constants: GasConstants>(
+        &self,
+        _context: &Self::Context,
+    ) -> Result<Gas, GasOverflow> {
+        self.mantle_tx
+            .ops()
             .iter()
             .map(Op::execution_gas::<Constants>)
-            .sum::<Gas>()
-            + self.mantle_tx.ledger_tx.execution_gas::<Constants>();
-        let storage_gas = self.gas_storage_size();
+            .try_fold(Gas::from(0), Gas::checked_add)
+    }
 
-        execution_gas * self.mantle_tx.execution_gas_price
-            + storage_gas * self.mantle_tx.storage_gas_price
+    fn storage_gas_consumption(&self, _context: &Self::Context) -> Result<Gas, GasOverflow> {
+        Ok(self.gas_storage_size().into())
+    }
+}
+
+impl StorageSize for SignedMantleTx {
+    fn storage_size(&self) -> usize {
+        self.gas_storage_size() as usize
     }
 }
 
@@ -382,38 +652,104 @@ impl<'de> Deserialize<'de> for SignedMantleTx {
         struct SignedMantleTxHelper {
             mantle_tx: MantleTx,
             ops_proofs: Vec<OpProof>,
-            ledger_tx_proof: ZkSignature,
         }
 
         let helper = SignedMantleTxHelper::deserialize(deserializer)?;
-        Self::new(helper.mantle_tx, helper.ops_proofs, helper.ledger_tx_proof)
-            .map_err(serde::de::Error::custom)
+        Self::new(helper.mantle_tx, helper.ops_proofs).map_err(serde::de::Error::custom)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use lb_key_management_system_keys::keys::{Ed25519Key, ZkKey};
+    use lb_key_management_system_keys::keys::{Ed25519Key, ZkKey, ZkPublicKey};
+    use num_bigint::BigUint;
 
     use super::*;
-    use crate::mantle::{ledger::Tx as LedgerTx, ops::channel::inscribe::InscriptionOp};
+    use crate::{
+        mantle::{Note, ledger::Outputs, ops::channel::inscribe::InscriptionOp},
+        proofs::channel_multi_sig_proof::IndexedSignature,
+    };
 
     fn create_test_mantle_tx(ops: Vec<Op>) -> MantleTx {
-        MantleTx {
-            ops,
-            ledger_tx: LedgerTx::new(vec![], vec![]),
-            execution_gas_price: 1,
-            storage_gas_price: 1,
-        }
+        MantleTx(Ops::new_unchecked(ops))
     }
 
     fn create_test_inscribe_op(signing_key: &Ed25519Key) -> InscriptionOp {
         InscriptionOp {
             channel_id: [0; 32].into(),
-            inscription: vec![1, 2, 3],
+            inscription: [1, 2, 3].into(),
             parent: [0; 32].into(),
             signer: signing_key.public_key(),
         }
+    }
+
+    struct TestOperationVerificationHelper {
+        thresholds: HashMap<ChannelId, ChannelKeyIndex>,
+        keys: HashMap<(ChannelId, ChannelKeyIndex), Ed25519PublicKey>,
+    }
+
+    impl TestOperationVerificationHelper {
+        fn new(
+            thresholds: impl IntoIterator<Item = (ChannelId, ChannelKeyIndex)>,
+            keys: impl IntoIterator<Item = ((ChannelId, ChannelKeyIndex), Ed25519PublicKey)>,
+        ) -> Self {
+            Self {
+                thresholds: thresholds.into_iter().collect(),
+                keys: keys.into_iter().collect(),
+            }
+        }
+    }
+
+    impl OperationVerificationHelper for TestOperationVerificationHelper {
+        fn get_channel_withdraw_threshold(
+            &self,
+            channel_id: &ChannelId,
+        ) -> Result<ChannelKeyIndex, VerificationError> {
+            self.thresholds
+                .get(channel_id)
+                .copied()
+                .ok_or(VerificationError::ChannelNotFound {
+                    channel_id: *channel_id,
+                })
+        }
+
+        fn get_key_from_channel_at_index(
+            &self,
+            channel_id: &ChannelId,
+            key_index: &ChannelKeyIndex,
+        ) -> Result<Ed25519PublicKey, VerificationError> {
+            self.keys.get(&(*channel_id, *key_index)).copied().ok_or(
+                VerificationError::KeyNotFound {
+                    channel_id: *channel_id,
+                    key_index: *key_index,
+                },
+            )
+        }
+    }
+
+    fn create_withdraw_tx(channel_id: ChannelId, signing_keys: &[&Ed25519Key]) -> SignedMantleTx {
+        let withdraw_note = Note {
+            value: 5,
+            pk: ZkPublicKey::from(Fr::from(BigUint::from(0u32))),
+        };
+        let mantle_tx = create_test_mantle_tx(vec![Op::ChannelWithdraw(ChannelWithdrawOp {
+            channel_id,
+            outputs: Outputs::new(vec![withdraw_note]),
+            withdraw_nonce: 0,
+        })]);
+        let tx_hash = mantle_tx.hash();
+        let signatures = signing_keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| {
+                IndexedSignature::new(
+                    index as ChannelKeyIndex,
+                    key.sign_payload(tx_hash.as_signing_bytes().as_ref()),
+                )
+            })
+            .collect();
+        let proof = ChannelMultiSigProof::new(signatures).unwrap();
+        SignedMantleTx::new(mantle_tx, vec![OpProof::ChannelMultiSigProof(proof)]).unwrap()
     }
 
     #[test]
@@ -426,11 +762,7 @@ mod tests {
         let tx_hash = mantle_tx.hash();
         let signature = signing_key.sign_payload(&tx_hash.as_signing_bytes());
 
-        let result = SignedMantleTx::new(
-            mantle_tx,
-            vec![OpProof::Ed25519Sig(signature)],
-            ZkKey::multi_sign(&[], tx_hash.as_ref()).unwrap(),
-        );
+        let result = SignedMantleTx::new(mantle_tx, vec![OpProof::Ed25519Sig(signature)]);
 
         assert!(result.is_ok());
     }
@@ -440,9 +772,7 @@ mod tests {
         let signing_key = Ed25519Key::from_bytes(&[1; 32]);
         let inscribe_op = create_test_inscribe_op(&signing_key);
         let mantle_tx = create_test_mantle_tx(vec![Op::ChannelInscribe(inscribe_op)]);
-
-        let ledger_tx_proof = ZkKey::multi_sign(&[], mantle_tx.hash().as_ref()).unwrap();
-        let result = SignedMantleTx::new(mantle_tx, vec![], ledger_tx_proof);
+        let result = SignedMantleTx::new(mantle_tx, vec![]);
 
         assert!(matches!(
             result,
@@ -464,11 +794,7 @@ mod tests {
         let tx_hash = mantle_tx.hash();
         let signature = wrong_signing_key.sign_payload(&tx_hash.as_signing_bytes());
 
-        let result = SignedMantleTx::new(
-            mantle_tx,
-            vec![OpProof::Ed25519Sig(signature)],
-            ZkKey::multi_sign(&[], tx_hash.as_ref()).unwrap(),
-        );
+        let result = SignedMantleTx::new(mantle_tx, vec![OpProof::Ed25519Sig(signature)]);
 
         assert!(matches!(
             result,
@@ -484,9 +810,8 @@ mod tests {
 
         // Use wrong proof type
         let tx_hash = mantle_tx.hash();
-        let zk_sig = OpProof::ZkSig(ZkKey::multi_sign(&[], tx_hash.as_ref()).unwrap());
-        let ledger_tx_proof = ZkKey::multi_sign(&[], tx_hash.as_ref()).unwrap();
-        let result = SignedMantleTx::new(mantle_tx, vec![zk_sig], ledger_tx_proof);
+        let zk_sig = OpProof::ZkSig(ZkKey::multi_sign(&[], &tx_hash.to_fr()).unwrap());
+        let result = SignedMantleTx::new(mantle_tx, vec![zk_sig]);
 
         assert!(matches!(
             result,
@@ -517,7 +842,6 @@ mod tests {
         let result = SignedMantleTx::new(
             mantle_tx,
             vec![OpProof::Ed25519Sig(sig1), OpProof::Ed25519Sig(sig2)],
-            ZkKey::multi_sign(&[], tx_hash.as_ref()).unwrap(),
         );
 
         assert!(result.is_ok());
@@ -544,7 +868,6 @@ mod tests {
         let result = SignedMantleTx::new(
             mantle_tx,
             vec![OpProof::Ed25519Sig(sig1), OpProof::Ed25519Sig(sig2)],
-            ZkKey::multi_sign(&[], tx_hash.as_ref()).unwrap(),
         );
 
         assert!(matches!(
@@ -562,12 +885,8 @@ mod tests {
         let tx_hash = mantle_tx.hash();
         let signature = signing_key.sign_payload(&tx_hash.as_signing_bytes());
 
-        let signed_tx = SignedMantleTx::new(
-            mantle_tx,
-            vec![OpProof::Ed25519Sig(signature)],
-            ZkKey::multi_sign(&[], tx_hash.as_ref()).unwrap(),
-        )
-        .unwrap();
+        let signed_tx =
+            SignedMantleTx::new(mantle_tx, vec![OpProof::Ed25519Sig(signature)]).unwrap();
 
         // Serialize and deserialize
         let serialized = serde_json::to_string(&signed_tx).unwrap();
@@ -583,11 +902,9 @@ mod tests {
         let inscribe_op = create_test_inscribe_op(&signing_key);
         let mantle_tx = create_test_mantle_tx(vec![Op::ChannelInscribe(inscribe_op)]);
 
-        let ledger_tx_proof = ZkKey::multi_sign(&[], mantle_tx.hash().as_ref()).unwrap();
         let helper = SignedMantleTx {
             mantle_tx,
             ops_proofs: vec![],
-            ledger_tx_proof,
         };
 
         let serialized = serde_json::to_string(&helper).unwrap();
@@ -597,7 +914,7 @@ mod tests {
         let err_msg = deserialized.unwrap_err().to_string();
         assert_eq!(
             err_msg,
-            "Number of proofs (0) does not match number of operations (1)"
+            "The number of proofs (0) does not match the number of operations (1)"
         );
     }
 
@@ -614,7 +931,6 @@ mod tests {
         let helper = SignedMantleTx {
             mantle_tx,
             ops_proofs: vec![OpProof::Ed25519Sig(wrong_signature)],
-            ledger_tx_proof: ZkKey::multi_sign(&[], tx_hash.as_ref()).unwrap(),
         };
 
         let serialized = serde_json::to_string(&helper).unwrap();
@@ -634,8 +950,7 @@ mod tests {
         let signature = signing_key.sign_payload(&tx_hash.as_signing_bytes());
 
         // Test too few proofs
-        let ledger_tx_proof = ZkKey::multi_sign(&[], tx_hash.as_ref()).unwrap();
-        let result = SignedMantleTx::new(mantle_tx.clone(), vec![], ledger_tx_proof);
+        let result = SignedMantleTx::new(mantle_tx.clone(), vec![]);
         assert!(matches!(
             result,
             Err(VerificationError::ProofCountMismatch {
@@ -651,7 +966,6 @@ mod tests {
                 OpProof::Ed25519Sig(signature),
                 OpProof::Ed25519Sig(signature),
             ],
-            ZkKey::multi_sign(&[], tx_hash.as_ref()).unwrap(),
         );
         assert!(matches!(
             result,
@@ -660,5 +974,104 @@ mod tests {
                 proofs_count: 2
             })
         ));
+    }
+
+    #[test]
+    fn helper_backed_verification_accepts_valid_channel_withdraw() {
+        let channel_id = ChannelId::from([8u8; 32]);
+        let key0 = Ed25519Key::from_bytes(&[8; 32]);
+        let key1 = Ed25519Key::from_bytes(&[9; 32]);
+        let signed_tx = create_withdraw_tx(channel_id, &[&key0, &key1]);
+
+        let helper = TestOperationVerificationHelper::new(
+            [(channel_id, 2)],
+            [
+                ((channel_id, 0), key0.public_key()),
+                ((channel_id, 1), key1.public_key()),
+            ],
+        );
+
+        assert!(signed_tx.verify_ops_proofs_with_helper(&helper).is_ok());
+    }
+
+    #[test]
+    fn helper_backed_verification_rejects_missing_channel() {
+        let channel_id = ChannelId::from([10u8; 32]);
+        let key0 = Ed25519Key::from_bytes(&[0; 32]);
+        let signed_tx = create_withdraw_tx(channel_id, &[&key0]);
+
+        let helper = TestOperationVerificationHelper::new([], []);
+
+        let verification_result = signed_tx.verify_ops_proofs_with_helper(&helper);
+        assert_eq!(
+            verification_result,
+            Err(VerificationError::ChannelNotFound { channel_id })
+        );
+    }
+
+    #[test]
+    fn helper_backed_verification_rejects_missing_key() {
+        let channel_id = ChannelId::from([10u8; 32]);
+        let key0 = Ed25519Key::from_bytes(&[0; 32]);
+        let key1 = Ed25519Key::from_bytes(&[1; 32]);
+        let signed_tx = create_withdraw_tx(channel_id, &[&key0, &key1]);
+
+        let helper = TestOperationVerificationHelper::new(
+            [(channel_id, 2)],
+            [((channel_id, 0), key0.public_key())],
+        );
+
+        let verification_result = signed_tx.verify_ops_proofs_with_helper(&helper);
+        assert_eq!(
+            verification_result,
+            Err(VerificationError::KeyNotFound {
+                channel_id,
+                key_index: 1
+            })
+        );
+    }
+
+    #[test]
+    fn helper_backed_verification_rejects_not_enough_signatures() {
+        let channel_id = ChannelId::from([10u8; 32]);
+        let key0 = Ed25519Key::from_bytes(&[0; 32]);
+        let signed_tx = create_withdraw_tx(channel_id, &[&key0]);
+
+        let helper = TestOperationVerificationHelper::new(
+            [(channel_id, 2)],
+            [((channel_id, 0), key0.public_key())],
+        );
+
+        let verification_result = signed_tx.verify_ops_proofs_with_helper(&helper);
+        assert_eq!(
+            verification_result,
+            Err(VerificationError::ChannelMultiSigProofNotEnoughSignatures {
+                op_index: 0,
+                actual: 1,
+                required: 2
+            })
+        );
+    }
+
+    #[test]
+    fn helper_backed_verification_rejects_invalid_signature() {
+        let channel_id = ChannelId::from([10u8; 32]);
+        let expected_key = Ed25519Key::from_bytes(&[0; 32]);
+        let wrong_key = Ed25519Key::from_bytes(&[9; 32]);
+        let signed_tx = create_withdraw_tx(channel_id, &[&wrong_key]);
+
+        let helper = TestOperationVerificationHelper::new(
+            [(channel_id, 1)],
+            [((channel_id, 0), expected_key.public_key())],
+        );
+
+        let verification_result = signed_tx.verify_ops_proofs_with_helper(&helper);
+        assert_eq!(
+            verification_result,
+            Err(VerificationError::ChannelMultiSigProofInvalidSignature {
+                op_index: 0,
+                signature_index: 0
+            })
+        );
     }
 }
